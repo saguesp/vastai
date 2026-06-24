@@ -9,7 +9,7 @@ WORKFLOW_DIR="${WORKFLOW_DIR:-${COMFYUI_DIR}/user/default/workflows}"
 CUSTOM_NODES_DIR="${CUSTOM_NODES_DIR:-${COMFYUI_DIR}/custom_nodes}"
 API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
-HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-3}"
+HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-1}"
 
 # Hugging Face token: set it in Vast.ai env vars as HF_TOKEN or HUGGING_FACE_HUB_TOKEN.
 # Do not hard-code secrets in this script if you publish it to GitHub.
@@ -25,11 +25,22 @@ INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
 DOWNLOAD_IDEOGRAM4="${DOWNLOAD_IDEOGRAM4:-1}"
 DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-1}"
 DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
-DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
-DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-1}"
+DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-0}"
+DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-0}"
 DOWNLOAD_IDEOGRAM_NVFP4="${DOWNLOAD_IDEOGRAM_NVFP4:-0}"
 DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-0}"
 UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
+
+# Safer defaults for Vast.ai provisioning.
+# SeedVR2 is optional and caused rotary_embedding_torch import errors in the previous run.
+INSTALL_SEEDVR2="${INSTALL_SEEDVR2:-0}"
+# Continue past custom-node install errors so model downloads are not blocked by optional nodes.
+SKIP_CUSTOM_NODE_ERRORS="${SKIP_CUSTOM_NODE_ERRORS:-1}"
+# Fail early with a clear message if there is not enough free disk for the selected model set.
+# Set REQUIRED_FREE_GB=0 to disable this check.
+REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-60}"
+# Keep large temporary Hugging Face downloads on /workspace instead of /tmp.
+HF_STAGING_DIR="${HF_STAGING_DIR:-${WORKSPACE_DIR}/.hf_downloads}"
 
 WORKFLOW_URL_IDEOGRAM4="https://raw.githubusercontent.com/AcademiaSD/comfyui_AcademiaSD/main/example_workflows/AcademiaSD_Ideogram-4_v16_Inpaint.json"
 WORKFLOW_FILE_IDEOGRAM4="${WORKFLOW_DIR}/AcademiaSD_Ideogram-4_v16_Inpaint.json"
@@ -62,9 +73,14 @@ main() {
   update_comfyui
   install_base_python_deps
   maybe_upgrade_torch_for_rtx50
-  install_custom_nodes
+
+  # Download workflows before custom nodes so a single optional node cannot leave
+  # the instance without any workflows installed.
   download_workflows
+  install_custom_nodes
+
   build_model_list
+  check_workspace_free_space
   download_all_hf_models
   write_api_wrapper_note
   log "Provisioning completed. Workflows are in: ${WORKFLOW_DIR}"
@@ -154,6 +170,27 @@ update_comfyui() {
   fi
 }
 
+
+check_workspace_free_space() {
+  if [ "${REQUIRED_FREE_GB}" = "0" ]; then
+    log "REQUIRED_FREE_GB=0; skipping free disk check."
+    return 0
+  fi
+
+  local free_gb
+  free_gb=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+  free_gb="${free_gb:-0}"
+
+  log "Free disk in ${WORKSPACE_DIR}: ${free_gb} GB. Required minimum: ${REQUIRED_FREE_GB} GB."
+
+  if [ "$free_gb" -lt "$REQUIRED_FREE_GB" ]; then
+    echo "ERROR: not enough free disk in ${WORKSPACE_DIR}." >&2
+    echo "ERROR: free=${free_gb}GB required=${REQUIRED_FREE_GB}GB." >&2
+    echo "ERROR: increase Vast.ai disk size or set DOWNLOAD_FLUX2_KLEIN=0 / DOWNLOAD_ADONIS_FLUX2KLEIN=0 / DOWNLOAD_IDEOGRAM4_UNCONDITIONAL=0." >&2
+    return 1
+  fi
+}
+
 maybe_upgrade_torch_for_rtx50() {
   if [ "$UPGRADE_TORCH_FOR_RTX50" != "1" ]; then
     log "Keeping the image's existing PyTorch/CUDA stack. Set UPGRADE_TORCH_FOR_RTX50=1 only if your base image lacks RTX 50 support."
@@ -180,7 +217,24 @@ ensure_layout() {
 install_base_python_deps() {
   log "Installing base Python dependencies for Hugging Face, GGUF loaders and text encoders..."
   python -m pip install --upgrade pip setuptools wheel
-  python -m pip install --upgrade huggingface_hub hf_transfer hf-xet gguf safetensors accelerate transformers sentencepiece protobuf qwen-vl-utils
+  python -m pip install --upgrade     huggingface_hub     hf_transfer     hf-xet     gguf     safetensors     accelerate     transformers     sentencepiece     protobuf     qwen-vl-utils     rotary-embedding-torch
+}
+
+run_maybe_nonfatal() {
+  local description="$1"
+  shift
+
+  if "$@"; then
+    return 0
+  fi
+
+  if [ "$SKIP_CUSTOM_NODE_ERRORS" = "1" ]; then
+    log "WARNING: ${description} failed; continuing because SKIP_CUSTOM_NODE_ERRORS=1."
+    return 0
+  fi
+
+  log "ERROR: ${description} failed."
+  return 1
 }
 
 clone_or_update() {
@@ -201,6 +255,13 @@ clone_or_update() {
       git clone --depth 1 "$repo_url" "$target_dir"
     fi
   fi
+}
+
+clone_or_update_safe() {
+  local repo_url="$1"
+  local dir_name="$2"
+  local clone_extra="${3:-}"
+  run_maybe_nonfatal "clone/update ${dir_name}" clone_or_update "$repo_url" "$dir_name" "$clone_extra"
 }
 
 install_node_requirements() {
@@ -228,37 +289,76 @@ run_node_install_script() {
   fi
 }
 
+disable_custom_node_if_present() {
+  local dir_name="$1"
+  local src_dir="${CUSTOM_NODES_DIR}/${dir_name}"
+  local disabled_dir="${COMFYUI_DIR}/custom_nodes_disabled"
+
+  if [ -d "$src_dir" ]; then
+    mkdir -p "$disabled_dir"
+    local dest_dir="${disabled_dir}/${dir_name}_disabled_$(date +%Y%m%d_%H%M%S)"
+    log "Disabling custom node ${dir_name}: moving it to ${dest_dir}"
+    mv "$src_dir" "$dest_dir"
+  fi
+}
+
+dedupe_comfyui_manager() {
+  # Some images already include ComfyUI-Manager while older scripts cloned comfyui-manager.
+  # Keeping both can make startup noisier and slower.
+  if [ -d "${CUSTOM_NODES_DIR}/ComfyUI-Manager" ] && [ -d "${CUSTOM_NODES_DIR}/comfyui-manager" ]; then
+    disable_custom_node_if_present "comfyui-manager"
+  fi
+}
+
 install_custom_nodes() {
   log "Installing custom nodes required by AcademiaSD Ideogram 4 and Flux.2 Klein workflows..."
 
+  dedupe_comfyui_manager
+
   if [ "$INSTALL_COMFYUI_MANAGER" = "1" ]; then
-    clone_or_update "https://github.com/Comfy-Org/ComfyUI-Manager.git" "comfyui-manager"
+    clone_or_update_safe "https://github.com/Comfy-Org/ComfyUI-Manager.git" "ComfyUI-Manager"
+    dedupe_comfyui_manager
   fi
 
-  clone_or_update "https://github.com/AcademiaSD/comfyui_AcademiaSD.git" "comfyui_AcademiaSD"
-  clone_or_update "https://github.com/city96/ComfyUI-GGUF.git" "ComfyUI-GGUF"
-  clone_or_update "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use" "recursive"
-  clone_or_update "https://github.com/yanokusnir-ai/one-node-flux-2-klein.git" "one-node-flux-2-klein"
-  clone_or_update "https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch.git" "ComfyUI-Inpaint-CropAndStitch"
-  clone_or_update "https://github.com/ainvfx/ComfyUI-SeedVR2_VideoUpscaler.git" "ComfyUI-SeedVR2_VideoUpscaler"
+  clone_or_update_safe "https://github.com/AcademiaSD/comfyui_AcademiaSD.git" "comfyui_AcademiaSD"
+  clone_or_update_safe "https://github.com/city96/ComfyUI-GGUF.git" "ComfyUI-GGUF"
+  clone_or_update_safe "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use" "recursive"
+  clone_or_update_safe "https://github.com/yanokusnir-ai/one-node-flux-2-klein.git" "one-node-flux-2-klein"
+  clone_or_update_safe "https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch.git" "ComfyUI-Inpaint-CropAndStitch"
 
-  for node_dir in \
-    "${CUSTOM_NODES_DIR}/comfyui-manager" \
-    "${CUSTOM_NODES_DIR}/comfyui_AcademiaSD" \
-    "${CUSTOM_NODES_DIR}/ComfyUI-GGUF" \
-    "${CUSTOM_NODES_DIR}/ComfyUI-Easy-Use" \
-    "${CUSTOM_NODES_DIR}/one-node-flux-2-klein" \
-    "${CUSTOM_NODES_DIR}/ComfyUI-Inpaint-CropAndStitch" \
-    "${CUSTOM_NODES_DIR}/ComfyUI-SeedVR2_VideoUpscaler"; do
-    install_node_requirements "$node_dir"
-    run_node_install_script "$node_dir"
+  if [ "$INSTALL_SEEDVR2" = "1" ]; then
+    clone_or_update_safe "https://github.com/ainvfx/ComfyUI-SeedVR2_VideoUpscaler.git" "ComfyUI-SeedVR2_VideoUpscaler"
+  else
+    log "INSTALL_SEEDVR2=0; skipping SeedVR2 video upscaler node."
+    disable_custom_node_if_present "ComfyUI-SeedVR2_VideoUpscaler"
+  fi
+
+  local node_dirs=(
+    "${CUSTOM_NODES_DIR}/ComfyUI-Manager"
+    "${CUSTOM_NODES_DIR}/comfyui_AcademiaSD"
+    "${CUSTOM_NODES_DIR}/ComfyUI-GGUF"
+    "${CUSTOM_NODES_DIR}/ComfyUI-Easy-Use"
+    "${CUSTOM_NODES_DIR}/one-node-flux-2-klein"
+    "${CUSTOM_NODES_DIR}/ComfyUI-Inpaint-CropAndStitch"
+  )
+
+  if [ "$INSTALL_SEEDVR2" = "1" ]; then
+    node_dirs+=("${CUSTOM_NODES_DIR}/ComfyUI-SeedVR2_VideoUpscaler")
+  fi
+
+  local node_dir
+  for node_dir in "${node_dirs[@]}"; do
+    run_maybe_nonfatal "install requirements for $(basename "$node_dir")" install_node_requirements "$node_dir"
+    run_maybe_nonfatal "run install script for $(basename "$node_dir")" run_node_install_script "$node_dir"
   done
 }
 
 download_workflows() {
   log "Downloading AcademiaSD Ideogram 4 inpaint workflow..."
   mkdir -p "$WORKFLOW_DIR"
-  download_url_file "$WORKFLOW_URL_IDEOGRAM4" "$WORKFLOW_FILE_IDEOGRAM4"
+  if ! download_url_file "$WORKFLOW_URL_IDEOGRAM4" "$WORKFLOW_FILE_IDEOGRAM4"; then
+    log "WARNING: failed to download AcademiaSD Ideogram 4 workflow; continuing."
+  fi
 }
 
 download_url_file() {
@@ -335,6 +435,8 @@ download_all_hf_models() {
     return 0
   fi
 
+  mkdir -p "$HF_STAGING_DIR"
+
   if [ -n "$HF_TOKEN" ]; then
     hf auth login --token "$HF_TOKEN" --add-to-git-credential >/dev/null 2>&1 || hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
   else
@@ -355,9 +457,17 @@ download_all_hf_models() {
   done
 
   local pid
+  local failed=0
   for pid in "${pids[@]}"; do
-    wait "$pid"
+    if ! wait "$pid"; then
+      failed=1
+    fi
   done
+
+  if [ "$failed" -ne 0 ]; then
+    echo "ERROR: one or more Hugging Face downloads failed." >&2
+    return 1
+  fi
 }
 
 download_hf_file() {
@@ -386,7 +496,7 @@ download_hf_file() {
     return 0
   fi
 
-  temp_dir=$(mktemp -d)
+  temp_dir=$(mktemp -d "${HF_STAGING_DIR}/download.XXXXXX")
 
   while [ "$attempt" -le "$max_retries" ]; do
     log "Downloading ${repo}/${file_path} to ${output_path} (attempt ${attempt}/${max_retries})..."
@@ -397,12 +507,15 @@ download_hf_file() {
     fi
 
     if hf download "$repo" "$file_path" --local-dir "$temp_dir" "${hf_token_args[@]}"; then
-      mv "${temp_dir}/${file_path}" "$output_path"
-      rm -rf "$temp_dir"
-      rmdir "$lockfile" || true
-      release_slot "$slot"
-      log "Downloaded: ${output_path}"
-      return 0
+      if [ -f "${temp_dir}/${file_path}" ]; then
+        mv -f "${temp_dir}/${file_path}" "$output_path"
+        rm -rf "$temp_dir"
+        rmdir "$lockfile" || true
+        release_slot "$slot"
+        log "Downloaded: ${output_path}"
+        return 0
+      fi
+      log "Download command succeeded but expected file was not found at ${temp_dir}/${file_path}."
     fi
 
     log "Download failed for ${repo}/${file_path}; retrying in ${retry_delay}s..."
@@ -419,22 +532,25 @@ download_hf_file() {
 }
 
 acquire_slot() {
+  local i
+  local slot
+
   while true; do
-    local count
-    local slot
-    count=$(find "$HF_SEMAPHORE_DIR" -name "slot_*" 2>/dev/null | wc -l)
-    if [ "$count" -lt "$HF_MAX_PARALLEL" ]; then
-      slot="${HF_SEMAPHORE_DIR}/slot_$$_$RANDOM"
-      touch "$slot"
-      echo "$slot"
-      return 0
-    fi
+    i=1
+    while [ "$i" -le "$HF_MAX_PARALLEL" ]; do
+      slot="${HF_SEMAPHORE_DIR}/slot_${i}"
+      if mkdir "$slot" 2>/dev/null; then
+        echo "$slot"
+        return 0
+      fi
+      i=$((i + 1))
+    done
     sleep 0.5
   done
 }
 
 release_slot() {
-  rm -f "$1"
+  rmdir "$1" 2>/dev/null || rm -rf "$1"
 }
 
 write_api_wrapper_note() {
