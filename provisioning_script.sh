@@ -11,9 +11,9 @@ API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
 HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-3}"
 
-# HF token embedded because this Vast.ai provisioning script is private.
-# You can still override it from Vast.ai env vars with HF_TOKEN or HUGGING_FACE_HUB_TOKEN.
-HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-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}}"
+# Hugging Face token: set it in Vast.ai env vars as HF_TOKEN or HUGGING_FACE_HUB_TOKEN.
+# Do not hard-code secrets in this script if you publish it to GitHub.
+HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
 HF_HOME="${HF_HOME:-${WORKSPACE_DIR}/.cache/huggingface}"
 HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
@@ -89,14 +89,68 @@ update_comfyui() {
     return 0
   fi
 
-  if [ -d "${COMFYUI_DIR}/.git" ]; then
-    log "Updating ComfyUI core so Flux.2 / Ideogram 4 nodes are available..."
-    git -C "$COMFYUI_DIR" pull --ff-only || git -C "$COMFYUI_DIR" pull --rebase
-    if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
-      python -m pip install -r "${COMFYUI_DIR}/requirements.txt"
-    fi
-  else
+  if [ ! -d "${COMFYUI_DIR}/.git" ]; then
     log "ComfyUI is not a git checkout at ${COMFYUI_DIR}; skipping core update."
+    return 0
+  fi
+
+  log "Updating ComfyUI core so Flux.2 / Ideogram 4 nodes are available..."
+
+  # Some Vast.ai templates ship ComfyUI in detached HEAD. A plain `git pull`
+  # fails there with: "You are not currently on a branch". This block detects
+  # that state, checks out the remote default branch, and continues. If Git still
+  # fails, the provisioning continues instead of aborting the whole instance.
+  local current_branch=""
+  local default_branch=""
+  local update_status=0
+
+  current_branch=$(git -C "$COMFYUI_DIR" symbolic-ref --short -q HEAD || true)
+
+  if [ -z "$current_branch" ]; then
+    log "ComfyUI is in detached HEAD; switching to the remote default branch before updating."
+
+    default_branch=$(git -C "$COMFYUI_DIR" remote show origin 2>/dev/null | awk '/HEAD branch/ {print $NF}' || true)
+    if [ -z "$default_branch" ] || [ "$default_branch" = "(unknown)" ]; then
+      if git -C "$COMFYUI_DIR" ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+        default_branch="main"
+      elif git -C "$COMFYUI_DIR" ls-remote --exit-code --heads origin master >/dev/null 2>&1; then
+        default_branch="master"
+      else
+        default_branch="main"
+      fi
+    fi
+
+    set +e
+    git -C "$COMFYUI_DIR" fetch --depth 1 origin "$default_branch"
+    update_status=$?
+    if [ "$update_status" -eq 0 ]; then
+      git -C "$COMFYUI_DIR" checkout -B "$default_branch" "origin/$default_branch"
+      update_status=$?
+    fi
+    set -e
+  else
+    set +e
+    git -C "$COMFYUI_DIR" pull --ff-only
+    update_status=$?
+    if [ "$update_status" -ne 0 ]; then
+      log "Fast-forward pull failed; trying fetch + hard reset for branch ${current_branch}."
+      git -C "$COMFYUI_DIR" fetch --depth 1 origin "$current_branch"
+      update_status=$?
+      if [ "$update_status" -eq 0 ]; then
+        git -C "$COMFYUI_DIR" reset --hard "origin/$current_branch"
+        update_status=$?
+      fi
+    fi
+    set -e
+  fi
+
+  if [ "$update_status" -ne 0 ]; then
+    log "WARNING: ComfyUI update failed; continuing with the version included in the image."
+    return 0
+  fi
+
+  if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
+    python -m pip install -r "${COMFYUI_DIR}/requirements.txt"
   fi
 }
 
