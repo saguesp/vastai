@@ -12,8 +12,9 @@ HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
 HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-1}"
 
 # Hugging Face token: set it in Vast.ai env vars as HF_TOKEN or HUGGING_FACE_HUB_TOKEN.
-# Do not hard-code secrets in this script if you publish it to GitHub.
-HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+# Requested fallback token is read-only; override it with env vars if you rotate it.
+# Do not publish this script with the fallback token still embedded.
+HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-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}}"
 HF_HOME="${HF_HOME:-${WORKSPACE_DIR}/.cache/huggingface}"
 HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
@@ -25,10 +26,13 @@ INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
 DOWNLOAD_IDEOGRAM4="${DOWNLOAD_IDEOGRAM4:-1}"
 DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-1}"
 DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
-DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-0}"
+DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
 DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-0}"
 DOWNLOAD_IDEOGRAM_NVFP4="${DOWNLOAD_IDEOGRAM_NVFP4:-0}"
-DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-0}"
+# Adonis targets FLUX.2 Klein 9B. It is enabled automatically with Adonis,
+# but you can set DOWNLOAD_FLUX2_KLEIN_9B=0 to skip the gated 9B base model.
+DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-$DOWNLOAD_ADONIS_FLUX2KLEIN}"
+DOWNLOAD_FLUX2_KLEIN_9B_FP8="${DOWNLOAD_FLUX2_KLEIN_9B_FP8:-0}"
 UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
 
 # Safer defaults for Vast.ai provisioning.
@@ -209,6 +213,7 @@ ensure_layout() {
     "$MODELS_DIR/diffusion_models" \
     "$MODELS_DIR/text_encoders" \
     "$MODELS_DIR/vae" \
+    "$MODELS_DIR/loras" \
     "$MODELS_DIR/loras/flux2_klein" \
     "$HF_SEMAPHORE_DIR" \
     "$HF_HOME"
@@ -417,14 +422,24 @@ build_model_list() {
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B" = "1" ]; then
-    # Optional gated/non-commercial 9B variant. Enable only after accepting the model terms on Hugging Face.
+    # Required for Adonis. This is gated/non-commercial; accept the terms on Hugging Face for the token first.
+    add_hf_model "black-forest-labs/FLUX.2-klein-9B" "flux-2-klein-9b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
+  fi
+
+  if [ "$DOWNLOAD_FLUX2_KLEIN_9B_FP8" = "1" ]; then
+    # Optional lighter 9B checkpoint. The full 9B above is preferred for Adonis quality.
     add_hf_model "black-forest-labs/FLUX.2-klein-9b-fp8" "flux-2-klein-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_ADONIS_FLUX2KLEIN" = "1" ]; then
-    add_hf_model "n8te0/adonis_flux2klein" "adonis_base.safetensors" "${MODELS_DIR}/loras/flux2_klein/adonis_base.safetensors"
-    add_hf_model "n8te0/adonis_flux2klein" "adonis_post.safetensors" "${MODELS_DIR}/loras/flux2_klein/adonis_post.safetensors"
-    add_hf_model "n8te0/adonis_flux2klein" "adonis_refine.safetensors" "${MODELS_DIR}/loras/flux2_klein/adonis_refine.safetensors"
+    # LoKr/LoRA files are placed directly in models/loras so One Node FLUX.2 Klein sees them in its LoRA selector.
+    add_hf_model "n8te0/adonis_flux2klein" "adonis_base.safetensors" "${MODELS_DIR}/loras/adonis_base.safetensors"
+    add_hf_model "n8te0/adonis_flux2klein" "adonis_post.safetensors" "${MODELS_DIR}/loras/adonis_post.safetensors"
+    add_hf_model "n8te0/adonis_flux2klein" "adonis_refine.safetensors" "${MODELS_DIR}/loras/adonis_refine.safetensors"
     add_hf_model "n8te0/adonis_flux2klein" "Adonis_Workflow.json" "${WORKFLOW_DIR}/Adonis_Workflow.json"
   fi
 }
