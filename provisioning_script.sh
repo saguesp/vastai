@@ -20,30 +20,55 @@ HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 export HF_TOKEN HF_HOME HF_HUB_ENABLE_HF_TRANSFER HF_XET_HIGH_PERFORMANCE
 
-# Toggle installs/downloads. Defaults are chosen for RTX 5090 quality-first use.
+# Toggle installs/downloads.
 UPDATE_COMFYUI="${UPDATE_COMFYUI:-1}"
 INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
+
+# Ideogram 4 remains enabled by default.
 DOWNLOAD_IDEOGRAM4="${DOWNLOAD_IDEOGRAM4:-1}"
-DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-1}"
-DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
-DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
 DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-0}"
 DOWNLOAD_IDEOGRAM_NVFP4="${DOWNLOAD_IDEOGRAM_NVFP4:-0}"
-# Adonis targets FLUX.2 Klein 9B. It is enabled automatically with Adonis,
-# but you can set DOWNLOAD_FLUX2_KLEIN_9B=0 to skip the gated 9B base model.
+
+# Vast.ai lightweight default:
+# Do NOT download FLUX.2 Klein 4B full by default.
+DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-0}"
+
+# Optional FLUX.2 Klein 4B FP8 lightweight alternative.
+DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
+
+# Adonis remains enabled by default.
+# WARNING: Adonis enables FLUX.2 Klein 9B by default below.
+DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
+
+# Adonis targets FLUX.2 Klein 9B. It is enabled automatically with Adonis.
+# For a much lighter machine, set DOWNLOAD_ADONIS_FLUX2KLEIN=0 or DOWNLOAD_FLUX2_KLEIN_9B=0.
 DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-$DOWNLOAD_ADONIS_FLUX2KLEIN}"
 DOWNLOAD_FLUX2_KLEIN_9B_FP8="${DOWNLOAD_FLUX2_KLEIN_9B_FP8:-0}"
+
 UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
 
+# ComfyUI memory behavior for Vast.ai.
+# --cache-none disables ComfyUI RAM cache.
+# --fast-disk prefers disk-backed dynamic loading instead of unpinned RAM.
+# --highvram keeps models in GPU memory instead of unloading them back to CPU RAM after use.
+# If CUDA OOM happens, replace --highvram with --normalvram or remove it.
+if [ -z "${COMFYUI_MEMORY_ARGS:-}" ]; then
+  COMFYUI_MEMORY_ARGS="--cache-none --fast-disk --highvram --disable-auto-launch"
+fi
+
+# Some ComfyUI Docker/Vast templates read CLI_ARGS.
+# This makes the memory flags available for templates that support it.
+CLI_ARGS="${CLI_ARGS:-$COMFYUI_MEMORY_ARGS}"
+
+# Optional: safer PyTorch CUDA allocator defaults.
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+export COMFYUI_MEMORY_ARGS CLI_ARGS PYTORCH_CUDA_ALLOC_CONF
+
 # Safer defaults for Vast.ai provisioning.
-# SeedVR2 is optional and caused rotary_embedding_torch import errors in the previous run.
 INSTALL_SEEDVR2="${INSTALL_SEEDVR2:-0}"
-# Continue past custom-node install errors so model downloads are not blocked by optional nodes.
 SKIP_CUSTOM_NODE_ERRORS="${SKIP_CUSTOM_NODE_ERRORS:-1}"
-# Fail early with a clear message if there is not enough free disk for the selected model set.
-# Set REQUIRED_FREE_GB=0 to disable this check.
 REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-60}"
-# Keep large temporary Hugging Face downloads on /workspace instead of /tmp.
 HF_STAGING_DIR="${HF_STAGING_DIR:-${WORKSPACE_DIR}/.hf_downloads}"
 
 WORKFLOW_URL_IDEOGRAM4="https://raw.githubusercontent.com/AcademiaSD/comfyui_AcademiaSD/main/example_workflows/AcademiaSD_Ideogram-4_v16_Inpaint.json"
@@ -78,21 +103,22 @@ main() {
   install_base_python_deps
   maybe_upgrade_torch_for_rtx50
 
-  # Download workflows before custom nodes so a single optional node cannot leave
-  # the instance without any workflows installed.
   download_workflows
   install_custom_nodes
 
   build_model_list
   check_workspace_free_space
   download_all_hf_models
+  write_comfyui_memory_launchers
   write_api_wrapper_note
+
   log "Provisioning completed. Workflows are in: ${WORKFLOW_DIR}"
+  log "Light RAM launcher created at: ${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
+  log "Recommended ComfyUI memory args: ${COMFYUI_MEMORY_ARGS}"
 }
 
 activate_python_env() {
   if [ -f /venv/main/bin/activate ]; then
-    # Vast.ai / RunPod-style ComfyUI base images usually use this venv.
     # shellcheck disable=SC1091
     . /venv/main/bin/activate
   elif [ -f "${COMFYUI_DIR}/venv/bin/activate" ]; then
@@ -116,10 +142,6 @@ update_comfyui() {
 
   log "Updating ComfyUI core so Flux.2 / Ideogram 4 nodes are available..."
 
-  # Some Vast.ai templates ship ComfyUI in detached HEAD. A plain `git pull`
-  # fails there with: "You are not currently on a branch". This block detects
-  # that state, checks out the remote default branch, and continues. If Git still
-  # fails, the provisioning continues instead of aborting the whole instance.
   local current_branch=""
   local default_branch=""
   local update_status=0
@@ -174,7 +196,6 @@ update_comfyui() {
   fi
 }
 
-
 check_workspace_free_space() {
   if [ "${REQUIRED_FREE_GB}" = "0" ]; then
     log "REQUIRED_FREE_GB=0; skipping free disk check."
@@ -190,7 +211,9 @@ check_workspace_free_space() {
   if [ "$free_gb" -lt "$REQUIRED_FREE_GB" ]; then
     echo "ERROR: not enough free disk in ${WORKSPACE_DIR}." >&2
     echo "ERROR: free=${free_gb}GB required=${REQUIRED_FREE_GB}GB." >&2
-    echo "ERROR: increase Vast.ai disk size or set DOWNLOAD_FLUX2_KLEIN=0 / DOWNLOAD_ADONIS_FLUX2KLEIN=0 / DOWNLOAD_IDEOGRAM4_UNCONDITIONAL=0." >&2
+    echo "ERROR: increase Vast.ai disk size or disable large model downloads." >&2
+    echo "ERROR: suggested lightweight env vars:" >&2
+    echo "ERROR: DOWNLOAD_FLUX2_KLEIN=0 DOWNLOAD_ADONIS_FLUX2KLEIN=0 DOWNLOAD_FLUX2_KLEIN_9B=0" >&2
     return 1
   fi
 }
@@ -216,13 +239,25 @@ ensure_layout() {
     "$MODELS_DIR/loras" \
     "$MODELS_DIR/loras/flux2_klein" \
     "$HF_SEMAPHORE_DIR" \
-    "$HF_HOME"
+    "$HF_HOME" \
+    "$HF_STAGING_DIR"
 }
 
 install_base_python_deps() {
   log "Installing base Python dependencies for Hugging Face, GGUF loaders and text encoders..."
   python -m pip install --upgrade pip setuptools wheel
-  python -m pip install --upgrade     huggingface_hub     hf_transfer     hf-xet     gguf     safetensors     accelerate     transformers     sentencepiece     protobuf     qwen-vl-utils     rotary-embedding-torch
+  python -m pip install --upgrade \
+    huggingface_hub \
+    hf_transfer \
+    hf-xet \
+    gguf \
+    safetensors \
+    accelerate \
+    transformers \
+    sentencepiece \
+    protobuf \
+    qwen-vl-utils \
+    rotary-embedding-torch
 }
 
 run_maybe_nonfatal() {
@@ -308,8 +343,6 @@ disable_custom_node_if_present() {
 }
 
 dedupe_comfyui_manager() {
-  # Some images already include ComfyUI-Manager while older scripts cloned comfyui-manager.
-  # Keeping both can make startup noisier and slower.
   if [ -d "${CUSTOM_NODES_DIR}/ComfyUI-Manager" ] && [ -d "${CUSTOM_NODES_DIR}/comfyui-manager" ]; then
     disable_custom_node_if_present "comfyui-manager"
   fi
@@ -390,11 +423,12 @@ build_model_list() {
   HF_MODELS=()
 
   if [ "$DOWNLOAD_IDEOGRAM4" = "1" ]; then
-    # Main workflow: AcademiaSD_Ideogram-4_v16_Inpaint.json
     add_hf_model "Comfy-Org/Ideogram-4" "diffusion_models/ideogram4_fp8_scaled.safetensors" "${MODELS_DIR}/diffusion_models/ideogram4_fp8_scaled.safetensors"
+
     if [ "$DOWNLOAD_IDEOGRAM4_UNCONDITIONAL" = "1" ]; then
       add_hf_model "Comfy-Org/Ideogram-4" "diffusion_models/ideogram4_unconditional_fp8_scaled.safetensors" "${MODELS_DIR}/diffusion_models/ideogram4_unconditional_fp8_scaled.safetensors"
     fi
+
     add_hf_model "Comfy-Org/Ideogram-4" "text_encoders/qwen3vl_8b_fp8_scaled.safetensors" "${MODELS_DIR}/text_encoders/qwen3vl_8b_fp8_scaled.safetensors"
     add_hf_model "HauhauCS/Qwen3VL-8B-Uncensored-HauhauCS-Aggressive" "Qwen3VL-8B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" "${MODELS_DIR}/text_encoders/Qwen3VL-8B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
     add_hf_model "Comfy-Org/gemma-4" "text_encoders/gemma4_e4b_it_fp8_scaled.safetensors" "${MODELS_DIR}/text_encoders/gemma4_e4b_it_fp8_scaled.safetensors"
@@ -402,41 +436,40 @@ build_model_list() {
   fi
 
   if [ "$DOWNLOAD_IDEOGRAM_NVFP4" = "1" ]; then
-    # Optional Ideogram 4 low-VRAM alternatives. The official v16 workflow points to the FP8 filenames above by default.
     add_hf_model "Comfy-Org/Ideogram-4" "diffusion_models/ideogram4_nvfp4_mixed.safetensors" "${MODELS_DIR}/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
     add_hf_model "Comfy-Org/Ideogram-4" "text_encoders/qwen3vl_8b_nvfp4.safetensors" "${MODELS_DIR}/text_encoders/qwen3vl_8b_nvfp4.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN" = "1" ]; then
-    # Requested explicitly: Flux.2 Klein, not Flux.2 base/dev.
-    # RTX 5090 quality-first default: full non-FP8 4B model + full Qwen 3 4B text encoder.
+    # Optional only. Disabled by default for Vast.ai lightweight provisioning.
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/diffusion_models/flux-2-klein-4b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-4b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/text_encoders/qwen_3_4b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_4b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_FP8" = "1" ]; then
-    # Optional lightweight fallback for low VRAM or if the full checkpoint is not desired.
+    # Optional lightweight FLUX.2 Klein 4B alternative.
     add_hf_model "black-forest-labs/FLUX.2-klein-4b-fp8" "flux-2-klein-4b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-4b-fp8.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/text_encoders/qwen_3_4b_fp4_flux2.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_4b_fp4_flux2.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B" = "1" ]; then
-    # Required for Adonis. This is gated/non-commercial; accept the terms on Hugging Face for the token first.
+    # Required for Adonis. This is gated/non-commercial.
+    # Accept the terms on Hugging Face for the token first.
     add_hf_model "black-forest-labs/FLUX.2-klein-9B" "flux-2-klein-9b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B_FP8" = "1" ]; then
-    # Optional lighter 9B checkpoint. The full 9B above is preferred for Adonis quality.
+    # Optional lighter 9B checkpoint.
     add_hf_model "black-forest-labs/FLUX.2-klein-9b-fp8" "flux-2-klein-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_ADONIS_FLUX2KLEIN" = "1" ]; then
-    # LoKr/LoRA files are placed directly in models/loras so One Node FLUX.2 Klein sees them in its LoRA selector.
     add_hf_model "n8te0/adonis_flux2klein" "adonis_base.safetensors" "${MODELS_DIR}/loras/adonis_base.safetensors"
     add_hf_model "n8te0/adonis_flux2klein" "adonis_post.safetensors" "${MODELS_DIR}/loras/adonis_post.safetensors"
     add_hf_model "n8te0/adonis_flux2klein" "adonis_refine.safetensors" "${MODELS_DIR}/loras/adonis_refine.safetensors"
@@ -459,6 +492,7 @@ download_all_hf_models() {
   fi
 
   log "Downloading ${#HF_MODELS[@]} Hugging Face files with max parallelism ${HF_MAX_PARALLEL}..."
+
   local pids=()
   local model repo file_path output_path
 
@@ -473,6 +507,7 @@ download_all_hf_models() {
 
   local pid
   local failed=0
+
   for pid in "${pids[@]}"; do
     if ! wait "$pid"; then
       failed=1
@@ -499,6 +534,7 @@ download_hf_file() {
   slot=$(acquire_slot)
 
   mkdir -p "$(dirname "$output_path")"
+
   while ! mkdir "$lockfile" 2>/dev/null; do
     log "Another process is downloading ${output_path}; waiting..."
     sleep 1
@@ -568,14 +604,81 @@ release_slot() {
   rmdir "$1" 2>/dev/null || rm -rf "$1"
 }
 
+write_comfyui_memory_launchers() {
+  log "Writing ComfyUI lightweight memory launch helpers..."
+
+  cat > "${WORKSPACE_DIR}/start_comfyui_light_ram.sh" <<EOF_LAUNCHER
+#!/bin/bash
+set -euo pipefail
+
+COMFYUI_DIR="\${COMFYUI_DIR:-${COMFYUI_DIR}}"
+COMFYUI_PORT="\${COMFYUI_PORT:-8188}"
+COMFYUI_MEMORY_ARGS="\${COMFYUI_MEMORY_ARGS:-${COMFYUI_MEMORY_ARGS}}"
+
+export PYTORCH_CUDA_ALLOC_CONF="\${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_CUDA_ALLOC_CONF}}"
+export CLI_ARGS="\${CLI_ARGS:-\${COMFYUI_MEMORY_ARGS}}"
+
+if [ -f /venv/main/bin/activate ]; then
+  . /venv/main/bin/activate
+elif [ -f "\${COMFYUI_DIR}/venv/bin/activate" ]; then
+  . "\${COMFYUI_DIR}/venv/bin/activate"
+fi
+
+cd "\${COMFYUI_DIR}"
+
+echo "[start] Starting ComfyUI with light RAM args: \${COMFYUI_MEMORY_ARGS}"
+exec python main.py --listen 0.0.0.0 --port "\${COMFYUI_PORT}" \${COMFYUI_MEMORY_ARGS} "\$@"
+EOF_LAUNCHER
+
+  chmod +x "${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
+
+  cat > "${WORKSPACE_DIR}/COMFYUI_LIGHT_RAM_ARGS.txt" <<EOF_ARGS
+Recommended ComfyUI launch args for this Vast.ai image:
+
+python main.py --listen 0.0.0.0 --port 8188 ${COMFYUI_MEMORY_ARGS}
+
+Equivalent args:
+
+${COMFYUI_MEMORY_ARGS}
+
+Notes:
+- --cache-none disables ComfyUI RAM cache.
+- --fast-disk prefers disk-backed dynamic loading.
+- --highvram keeps models in GPU memory instead of unloading them to CPU RAM.
+- If CUDA OOM happens, replace --highvram with --normalvram or remove it.
+- If RAM is still too high and VRAM is enough, try replacing --highvram with --gpu-only.
+EOF_ARGS
+
+  cat > "${WORKSPACE_DIR}/.comfyui_light_ram_env" <<EOF_ENV
+export COMFYUI_MEMORY_ARGS="${COMFYUI_MEMORY_ARGS}"
+export CLI_ARGS="${CLI_ARGS}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
+EOF_ENV
+
+  # Best-effort persistent environment for interactive shells.
+  if [ -d /etc/profile.d ] && [ -w /etc/profile.d ]; then
+    cat > /etc/profile.d/comfyui_light_ram.sh <<EOF_PROFILE
+export COMFYUI_MEMORY_ARGS="${COMFYUI_MEMORY_ARGS}"
+export CLI_ARGS="${CLI_ARGS}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
+EOF_PROFILE
+  fi
+
+  log "Created launcher: ${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
+  log "Created memory notes: ${WORKSPACE_DIR}/COMFYUI_LIGHT_RAM_ARGS.txt"
+}
+
 write_api_wrapper_note() {
-  # The AcademiaSD file requested is a ComfyUI UI workflow JSON, not a ComfyUI API prompt JSON.
-  # Do not overwrite /opt/comfyui-api-wrapper/payloads with an invalid API payload.
   if [ -d "$API_PAYLOAD_DIR" ]; then
     cat > "${API_PAYLOAD_DIR}/README_AcademiaSD_Ideogram4.txt" <<'NOTE'
 AcademiaSD_Ideogram-4_v16_Inpaint.json has been installed into the ComfyUI user workflows folder.
 It is a UI workflow JSON. If this serverless wrapper requires an API prompt JSON, load the workflow in ComfyUI,
 export it in API format, and place that exported JSON in this payloads directory.
+
+Memory note:
+This provisioning script creates /workspace/start_comfyui_light_ram.sh.
+Use that launcher, or start ComfyUI with:
+--cache-none --fast-disk --highvram --disable-auto-launch
 NOTE
   fi
 }
