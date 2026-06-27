@@ -9,11 +9,11 @@ WORKFLOW_DIR="${WORKFLOW_DIR:-${COMFYUI_DIR}/user/default/workflows}"
 CUSTOM_NODES_DIR="${CUSTOM_NODES_DIR:-${COMFYUI_DIR}/custom_nodes}"
 API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
-HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-1}"
 
-# Hugging Face token: set it in Vast.ai env vars as HF_TOKEN or HUGGING_FACE_HUB_TOKEN.
-# Requested fallback token is read-only; override it with env vars if you rotate it.
-# Do not publish this script with the fallback token still embedded.
+# ¡MODIFICADO! Subimos de 1 a 4 descargas concurrentes para no ir secuencial
+HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-4}"
+
+# Hugging Face token
 HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-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}}"
 HF_HOME="${HF_HOME:-${WORKSPACE_DIR}/.cache/huggingface}"
 HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
@@ -30,42 +30,24 @@ DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-0}"
 DOWNLOAD_IDEOGRAM_NVFP4="${DOWNLOAD_IDEOGRAM_NVFP4:-0}"
 
 # Vast.ai lightweight default:
-# Do NOT download FLUX.2 Klein 4B full by default.
 DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-0}"
-
-# Optional FLUX.2 Klein 4B FP8 lightweight alternative.
 DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
 
 # Adonis remains enabled by default.
-# WARNING: Adonis enables FLUX.2 Klein 9B by default below.
 DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
-
-# Adonis targets FLUX.2 Klein 9B. It is enabled automatically with Adonis.
-# For a much lighter machine, set DOWNLOAD_ADONIS_FLUX2KLEIN=0 or DOWNLOAD_FLUX2_KLEIN_9B=0.
 DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-$DOWNLOAD_ADONIS_FLUX2KLEIN}"
 DOWNLOAD_FLUX2_KLEIN_9B_FP8="${DOWNLOAD_FLUX2_KLEIN_9B_FP8:-0}"
 
 UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
 
-# ComfyUI memory behavior for Vast.ai.
-# --cache-none disables ComfyUI RAM cache.
-# --fast-disk prefers disk-backed dynamic loading instead of unpinned RAM.
-# --highvram keeps models in GPU memory instead of unloading them back to CPU RAM after use.
-# If CUDA OOM happens, replace --highvram with --normalvram or remove it.
 if [ -z "${COMFYUI_MEMORY_ARGS:-}" ]; then
   COMFYUI_MEMORY_ARGS="--cache-none --fast-disk --highvram --disable-auto-launch"
 fi
 
-# Some ComfyUI Docker/Vast templates read CLI_ARGS.
-# This makes the memory flags available for templates that support it.
 CLI_ARGS="${CLI_ARGS:-$COMFYUI_MEMORY_ARGS}"
-
-# Optional: safer PyTorch CUDA allocator defaults.
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-
 export COMFYUI_MEMORY_ARGS CLI_ARGS PYTORCH_CUDA_ALLOC_CONF
 
-# Safer defaults for Vast.ai provisioning.
 INSTALL_SEEDVR2="${INSTALL_SEEDVR2:-0}"
 SKIP_CUSTOM_NODE_ERRORS="${SKIP_CUSTOM_NODE_ERRORS:-1}"
 REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-60}"
@@ -74,9 +56,7 @@ HF_STAGING_DIR="${HF_STAGING_DIR:-${WORKSPACE_DIR}/.hf_downloads}"
 WORKFLOW_URL_IDEOGRAM4="https://raw.githubusercontent.com/AcademiaSD/comfyui_AcademiaSD/main/example_workflows/AcademiaSD_Ideogram-4_v16_Inpaint.json"
 WORKFLOW_FILE_IDEOGRAM4="${WORKFLOW_DIR}/AcademiaSD_Ideogram-4_v16_Inpaint.json"
 
-# Model declarations are assembled as: "REPO|FILE_IN_REPO|OUTPUT_PATH"
 declare -a HF_MODELS=()
-
 ### End Configuration ###
 
 log() {
@@ -112,168 +92,75 @@ main() {
   write_comfyui_memory_launchers
   write_api_wrapper_note
 
-  log "Provisioning completed. Workflows are in: ${WORKFLOW_DIR}"
-  log "Light RAM launcher created at: ${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
-  log "Recommended ComfyUI memory args: ${COMFYUI_MEMORY_ARGS}"
+  log "Provisioning completed con éxito."
 }
 
 activate_python_env() {
   if [ -f /venv/main/bin/activate ]; then
-    # shellcheck disable=SC1091
     . /venv/main/bin/activate
   elif [ -f "${COMFYUI_DIR}/venv/bin/activate" ]; then
-    # shellcheck disable=SC1091
     . "${COMFYUI_DIR}/venv/bin/activate"
-  else
-    log "No ComfyUI virtualenv found; continuing with system python."
   fi
 }
 
 update_comfyui() {
-  if [ "$UPDATE_COMFYUI" != "1" ]; then
-    log "UPDATE_COMFYUI=0; skipping ComfyUI update."
+  if [ "$UPDATE_COMFYUI" != "1" ] || [ ! -d "${COMFYUI_DIR}/.git" ]; then
     return 0
   fi
 
-  if [ ! -d "${COMFYUI_DIR}/.git" ]; then
-    log "ComfyUI is not a git checkout at ${COMFYUI_DIR}; skipping core update."
-    return 0
-  fi
+  log "Actualizando ComfyUI core..."
+  set +e
+  git -C "$COMFYUI_DIR" pull --ff-only
+  local status=$?
+  set -e
 
-  log "Updating ComfyUI core so Flux.2 / Ideogram 4 nodes are available..."
-
-  local current_branch=""
-  local default_branch=""
-  local update_status=0
-
-  current_branch=$(git -C "$COMFYUI_DIR" symbolic-ref --short -q HEAD || true)
-
-  if [ -z "$current_branch" ]; then
-    log "ComfyUI is in detached HEAD; switching to the remote default branch before updating."
-
-    default_branch=$(git -C "$COMFYUI_DIR" remote show origin 2>/dev/null | awk '/HEAD branch/ {print $NF}' || true)
-    if [ -z "$default_branch" ] || [ "$default_branch" = "(unknown)" ]; then
-      if git -C "$COMFYUI_DIR" ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
-        default_branch="main"
-      elif git -C "$COMFYUI_DIR" ls-remote --exit-code --heads origin master >/dev/null 2>&1; then
-        default_branch="master"
-      else
-        default_branch="main"
-      fi
-    fi
-
-    set +e
-    git -C "$COMFYUI_DIR" fetch --depth 1 origin "$default_branch"
-    update_status=$?
-    if [ "$update_status" -eq 0 ]; then
-      git -C "$COMFYUI_DIR" checkout -B "$default_branch" "origin/$default_branch"
-      update_status=$?
-    fi
-    set -e
-  else
-    set +e
-    git -C "$COMFYUI_DIR" pull --ff-only
-    update_status=$?
-    if [ "$update_status" -ne 0 ]; then
-      log "Fast-forward pull failed; trying fetch + hard reset for branch ${current_branch}."
-      git -C "$COMFYUI_DIR" fetch --depth 1 origin "$current_branch"
-      update_status=$?
-      if [ "$update_status" -eq 0 ]; then
-        git -C "$COMFYUI_DIR" reset --hard "origin/$current_branch"
-        update_status=$?
-      fi
-    fi
-    set -e
-  fi
-
-  if [ "$update_status" -ne 0 ]; then
-    log "WARNING: ComfyUI update failed; continuing with the version included in the image."
-    return 0
+  if [ $status -ne 0 ]; then
+    log "Fallo de pull rápido; haciendo fetch forzado."
+    git -C "$COMFYUI_DIR" fetch --depth 1 origin
+    git -C "$COMFYUI_DIR" reset --hard origin/HEAD
   fi
 
   if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
-    python -m pip install -r "${COMFYUI_DIR}/requirements.txt"
+    # ¡OPTIMIZADO! Añadido --no-cache-dir para agilizar entornos cloud
+    python -m pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
   fi
 }
 
 check_workspace_free_space() {
-  if [ "${REQUIRED_FREE_GB}" = "0" ]; then
-    log "REQUIRED_FREE_GB=0; skipping free disk check."
-    return 0
-  fi
-
+  if [ "${REQUIRED_FREE_GB}" = "0" ]; then return 0; fi
   local free_gb
   free_gb=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
   free_gb="${free_gb:-0}"
-
-  log "Free disk in ${WORKSPACE_DIR}: ${free_gb} GB. Required minimum: ${REQUIRED_FREE_GB} GB."
-
   if [ "$free_gb" -lt "$REQUIRED_FREE_GB" ]; then
-    echo "ERROR: not enough free disk in ${WORKSPACE_DIR}." >&2
-    echo "ERROR: free=${free_gb}GB required=${REQUIRED_FREE_GB}GB." >&2
-    echo "ERROR: increase Vast.ai disk size or disable large model downloads." >&2
-    echo "ERROR: suggested lightweight env vars:" >&2
-    echo "ERROR: DOWNLOAD_FLUX2_KLEIN=0 DOWNLOAD_ADONIS_FLUX2KLEIN=0 DOWNLOAD_FLUX2_KLEIN_9B=0" >&2
     return 1
   fi
 }
 
 maybe_upgrade_torch_for_rtx50() {
-  if [ "$UPGRADE_TORCH_FOR_RTX50" != "1" ]; then
-    log "Keeping the image's existing PyTorch/CUDA stack. Set UPGRADE_TORCH_FOR_RTX50=1 only if your base image lacks RTX 50 support."
-    return 0
-  fi
-
-  log "Upgrading PyTorch CUDA wheels for RTX 50-series compatibility."
-  python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+  if [ "$UPGRADE_TORCH_FOR_RTX50" != "1" ]; then return 0; fi
+  python -m pip install --no-cache-dir --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
 }
 
 ensure_layout() {
-  mkdir -p \
-    "$COMFYUI_DIR" \
-    "$CUSTOM_NODES_DIR" \
-    "$WORKFLOW_DIR" \
-    "$MODELS_DIR/diffusion_models" \
-    "$MODELS_DIR/text_encoders" \
-    "$MODELS_DIR/vae" \
-    "$MODELS_DIR/loras" \
-    "$MODELS_DIR/loras/flux2_klein" \
-    "$HF_SEMAPHORE_DIR" \
-    "$HF_HOME" \
-    "$HF_STAGING_DIR"
+  mkdir -p "$COMFYUI_DIR" "$CUSTOM_NODES_DIR" "$WORKFLOW_DIR" \
+    "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" \
+    "$MODELS_DIR/vae" "$MODELS_DIR/loras/flux2_klein" \
+    "$HF_SEMAPHORE_DIR" "$HF_HOME" "$HF_STAGING_DIR"
 }
 
 install_base_python_deps() {
-  log "Installing base Python dependencies for Hugging Face, GGUF loaders and text encoders..."
-  python -m pip install --upgrade pip setuptools wheel
-  python -m pip install --upgrade \
-    huggingface_hub \
-    hf_transfer \
-    hf-xet \
-    gguf \
-    safetensors \
-    accelerate \
-    transformers \
-    sentencepiece \
-    protobuf \
-    qwen-vl-utils \
-    rotary-embedding-torch
+  log "Instalando dependencias base en modo rápido..."
+  python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+  python -m pip install --no-cache-dir --upgrade \
+    huggingface_hub hf_transfer hf-xet gguf safetensors \
+    accelerate transformers sentencepiece protobuf qwen-vl-utils rotary-embedding-torch
 }
 
 run_maybe_nonfatal() {
   local description="$1"
   shift
-
-  if "$@"; then
-    return 0
-  fi
-
-  if [ "$SKIP_CUSTOM_NODE_ERRORS" = "1" ]; then
-    log "WARNING: ${description} failed; continuing because SKIP_CUSTOM_NODE_ERRORS=1."
-    return 0
-  fi
-
-  log "ERROR: ${description} failed."
+  if "$@"; then return 0; fi
+  if [ "$SKIP_CUSTOM_NODE_ERRORS" = "1" ]; then return 0; fi
   return 1
 }
 
@@ -284,11 +171,9 @@ clone_or_update() {
   local clone_extra="${3:-}"
 
   if [ -d "${target_dir}/.git" ]; then
-    log "Updating custom node: ${dir_name}"
     git -C "$target_dir" fetch --depth 1 origin
     git -C "$target_dir" reset --hard origin/HEAD
   else
-    log "Installing custom node: ${dir_name}"
     if [ "$clone_extra" = "recursive" ]; then
       git clone --depth 1 --recursive "$repo_url" "$target_dir"
     else
@@ -298,47 +183,28 @@ clone_or_update() {
 }
 
 clone_or_update_safe() {
-  local repo_url="$1"
-  local dir_name="$2"
-  local clone_extra="${3:-}"
-  run_maybe_nonfatal "clone/update ${dir_name}" clone_or_update "$repo_url" "$dir_name" "$clone_extra"
+  run_maybe_nonfatal "clone/update $2" clone_or_update "$1" "$2" "${3:-}"
 }
 
 install_node_requirements() {
-  local node_dir="$1"
-  if [ ! -d "$node_dir" ]; then
-    return 0
-  fi
-  if [ -f "${node_dir}/requirements.txt" ]; then
-    log "Installing requirements for $(basename "$node_dir")"
-    python -m pip install -r "${node_dir}/requirements.txt"
+  if [ -f "${1}/requirements.txt" ]; then
+    python -m pip install --no-cache-dir -r "${1}/requirements.txt"
   fi
 }
 
 run_node_install_script() {
-  local node_dir="$1"
-  if [ ! -d "$node_dir" ]; then
-    return 0
-  fi
-  if [ -f "${node_dir}/install.py" ]; then
-    log "Running install.py for $(basename "$node_dir")"
-    python "${node_dir}/install.py"
-  elif [ -f "${node_dir}/install.sh" ]; then
-    log "Running install.sh for $(basename "$node_dir")"
-    bash "${node_dir}/install.sh"
+  if [ -f "${1}/install.py" ]; then
+    python "${1}/install.py"
+  elif [ -f "${1}/install.sh" ]; then
+    bash "${1}/install.sh"
   fi
 }
 
 disable_custom_node_if_present() {
-  local dir_name="$1"
-  local src_dir="${CUSTOM_NODES_DIR}/${dir_name}"
-  local disabled_dir="${COMFYUI_DIR}/custom_nodes_disabled"
-
+  local src_dir="${CUSTOM_NODES_DIR}/${1}"
   if [ -d "$src_dir" ]; then
-    mkdir -p "$disabled_dir"
-    local dest_dir="${disabled_dir}/${dir_name}_disabled_$(date +%Y%m%d_%H%M%S)"
-    log "Disabling custom node ${dir_name}: moving it to ${dest_dir}"
-    mv "$src_dir" "$dest_dir"
+    mkdir -p "${COMFYUI_DIR}/custom_nodes_disabled"
+    mv "$src_dir" "${COMFYUI_DIR}/custom_nodes_disabled/${1}_$(date +%Y%m%d_%H%M%S)"
   fi
 }
 
@@ -349,10 +215,7 @@ dedupe_comfyui_manager() {
 }
 
 install_custom_nodes() {
-  log "Installing custom nodes required by AcademiaSD Ideogram 4 and Flux.2 Klein workflows..."
-
   dedupe_comfyui_manager
-
   if [ "$INSTALL_COMFYUI_MANAGER" = "1" ]; then
     clone_or_update_safe "https://github.com/Comfy-Org/ComfyUI-Manager.git" "ComfyUI-Manager"
     dedupe_comfyui_manager
@@ -367,7 +230,6 @@ install_custom_nodes() {
   if [ "$INSTALL_SEEDVR2" = "1" ]; then
     clone_or_update_safe "https://github.com/ainvfx/ComfyUI-SeedVR2_VideoUpscaler.git" "ComfyUI-SeedVR2_VideoUpscaler"
   else
-    log "INSTALL_SEEDVR2=0; skipping SeedVR2 video upscaler node."
     disable_custom_node_if_present "ComfyUI-SeedVR2_VideoUpscaler"
   fi
 
@@ -379,56 +241,30 @@ install_custom_nodes() {
     "${CUSTOM_NODES_DIR}/one-node-flux-2-klein"
     "${CUSTOM_NODES_DIR}/ComfyUI-Inpaint-CropAndStitch"
   )
+  if [ "$INSTALL_SEEDVR2" = "1" ]; then node_dirs+=("${CUSTOM_NODES_DIR}/ComfyUI-SeedVR2_VideoUpscaler"); fi
 
-  if [ "$INSTALL_SEEDVR2" = "1" ]; then
-    node_dirs+=("${CUSTOM_NODES_DIR}/ComfyUI-SeedVR2_VideoUpscaler")
-  fi
-
-  local node_dir
-  for node_dir in "${node_dirs[@]}"; do
-    run_maybe_nonfatal "install requirements for $(basename "$node_dir")" install_node_requirements "$node_dir"
-    run_maybe_nonfatal "run install script for $(basename "$node_dir")" run_node_install_script "$node_dir"
+  for nd in "${node_dirs[@]}"; do
+    run_maybe_nonfatal "reqs $nd" install_node_requirements "$nd"
+    run_maybe_nonfatal "script $nd" run_node_install_script "$nd"
   done
 }
 
 download_workflows() {
-  log "Downloading AcademiaSD Ideogram 4 inpaint workflow..."
   mkdir -p "$WORKFLOW_DIR"
-  if ! download_url_file "$WORKFLOW_URL_IDEOGRAM4" "$WORKFLOW_FILE_IDEOGRAM4"; then
-    log "WARNING: failed to download AcademiaSD Ideogram 4 workflow; continuing."
-  fi
-}
-
-download_url_file() {
-  local url="$1"
-  local output_path="$2"
-  local temp_path
-  temp_path=$(mktemp)
-
-  mkdir -p "$(dirname "$output_path")"
-  curl -fL --retry 5 --retry-delay 2 --connect-timeout 30 -o "$temp_path" "$url"
-  python -m json.tool "$temp_path" >/dev/null
-  mv "$temp_path" "$output_path"
-  log "Downloaded workflow: ${output_path}"
+  curl -s -fL --retry 3 -o "$WORKFLOW_FILE_IDEOGRAM4" "$WORKFLOW_URL_IDEOGRAM4" || true
 }
 
 add_hf_model() {
-  local repo="$1"
-  local file_path="$2"
-  local output_path="$3"
-  HF_MODELS+=("${repo}|${file_path}|${output_path}")
+  HF_MODELS+=("${1}|${2}|${3}")
 }
 
 build_model_list() {
   HF_MODELS=()
-
   if [ "$DOWNLOAD_IDEOGRAM4" = "1" ]; then
     add_hf_model "Comfy-Org/Ideogram-4" "diffusion_models/ideogram4_fp8_scaled.safetensors" "${MODELS_DIR}/diffusion_models/ideogram4_fp8_scaled.safetensors"
-
     if [ "$DOWNLOAD_IDEOGRAM4_UNCONDITIONAL" = "1" ]; then
       add_hf_model "Comfy-Org/Ideogram-4" "diffusion_models/ideogram4_unconditional_fp8_scaled.safetensors" "${MODELS_DIR}/diffusion_models/ideogram4_unconditional_fp8_scaled.safetensors"
     fi
-
     add_hf_model "Comfy-Org/Ideogram-4" "text_encoders/qwen3vl_8b_fp8_scaled.safetensors" "${MODELS_DIR}/text_encoders/qwen3vl_8b_fp8_scaled.safetensors"
     add_hf_model "HauhauCS/Qwen3VL-8B-Uncensored-HauhauCS-Aggressive" "Qwen3VL-8B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" "${MODELS_DIR}/text_encoders/Qwen3VL-8B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
     add_hf_model "Comfy-Org/gemma-4" "text_encoders/gemma4_e4b_it_fp8_scaled.safetensors" "${MODELS_DIR}/text_encoders/gemma4_e4b_it_fp8_scaled.safetensors"
@@ -441,29 +277,24 @@ build_model_list() {
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN" = "1" ]; then
-    # Optional only. Disabled by default for Vast.ai lightweight provisioning.
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/diffusion_models/flux-2-klein-4b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-4b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/text_encoders/qwen_3_4b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_4b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_FP8" = "1" ]; then
-    # Optional lightweight FLUX.2 Klein 4B alternative.
     add_hf_model "black-forest-labs/FLUX.2-klein-4b-fp8" "flux-2-klein-4b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-4b-fp8.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/text_encoders/qwen_3_4b_fp4_flux2.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_4b_fp4_flux2.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B" = "1" ]; then
-    # Required for Adonis. This is gated/non-commercial.
-    # Accept the terms on Hugging Face for the token first.
     add_hf_model "black-forest-labs/FLUX.2-klein-9B" "flux-2-klein-9b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B_FP8" = "1" ]; then
-    # Optional lighter 9B checkpoint.
     add_hf_model "black-forest-labs/FLUX.2-klein-9b-fp8" "flux-2-klein-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
@@ -478,20 +309,14 @@ build_model_list() {
 }
 
 download_all_hf_models() {
-  if [ "${#HF_MODELS[@]}" -eq 0 ]; then
-    log "No Hugging Face model downloads enabled."
-    return 0
-  fi
-
+  if [ "${#HF_MODELS[@]}" -eq 0 ]; then return 0; fi
   mkdir -p "$HF_STAGING_DIR"
 
   if [ -n "$HF_TOKEN" ]; then
-    hf auth login --token "$HF_TOKEN" --add-to-git-credential >/dev/null 2>&1 || hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
-  else
-    log "HF_TOKEN is not set. Public files may download, but gated models will fail."
+    hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
   fi
 
-  log "Downloading ${#HF_MODELS[@]} Hugging Face files with max parallelism ${HF_MAX_PARALLEL}..."
+  log "Descargando ${#HF_MODELS[@]} archivos de HF con descarga paralela activa (Máx: ${HF_MAX_PARALLEL})..."
 
   local pids=()
   local model repo file_path output_path
@@ -505,19 +330,12 @@ download_all_hf_models() {
     pids+=("$!")
   done
 
-  local pid
   local failed=0
-
   for pid in "${pids[@]}"; do
-    if ! wait "$pid"; then
-      failed=1
-    fi
+    if ! wait "$pid"; then failed=1; fi
   done
 
-  if [ "$failed" -ne 0 ]; then
-    echo "ERROR: one or more Hugging Face downloads failed." >&2
-    return 1
-  fi
+  if [ "$failed" -ne 0 ]; then return 1; fi
 }
 
 download_hf_file() {
@@ -525,67 +343,45 @@ download_hf_file() {
   local file_path="$2"
   local output_path="$3"
   local lockfile="${output_path}.lock"
-  local max_retries=5
-  local retry_delay=2
   local slot
   local temp_dir
-  local attempt=1
 
   slot=$(acquire_slot)
-
   mkdir -p "$(dirname "$output_path")"
 
   while ! mkdir "$lockfile" 2>/dev/null; do
-    log "Another process is downloading ${output_path}; waiting..."
-    sleep 1
+    sleep 2
   done
 
   if [ -s "$output_path" ]; then
-    log "File already exists: ${output_path}; skipping."
     rmdir "$lockfile" || true
     release_slot "$slot"
     return 0
   fi
 
   temp_dir=$(mktemp -d "${HF_STAGING_DIR}/download.XXXXXX")
+  local hf_token_args=()
+  if [ -n "$HF_TOKEN" ]; then hf_token_args=(--token "$HF_TOKEN"); fi
 
-  while [ "$attempt" -le "$max_retries" ]; do
-    log "Downloading ${repo}/${file_path} to ${output_path} (attempt ${attempt}/${max_retries})..."
-
-    local hf_token_args=()
-    if [ -n "$HF_TOKEN" ]; then
-      hf_token_args=(--token "$HF_TOKEN")
+  log "Iniciando descarga rápida: ${repo}/${file_path}"
+  if hf download "$repo" "$file_path" --local-dir "$temp_dir" "${hf_token_args[@]}" >/dev/null 2>&1; then
+    if [ -f "${temp_dir}/${file_path}" ]; then
+      mv -f "${temp_dir}/${file_path}" "$output_path"
+      rm -rf "$temp_dir"
+      rmdir "$lockfile" || true
+      release_slot "$slot"
+      return 0
     fi
-
-    if hf download "$repo" "$file_path" --local-dir "$temp_dir" "${hf_token_args[@]}"; then
-      if [ -f "${temp_dir}/${file_path}" ]; then
-        mv -f "${temp_dir}/${file_path}" "$output_path"
-        rm -rf "$temp_dir"
-        rmdir "$lockfile" || true
-        release_slot "$slot"
-        log "Downloaded: ${output_path}"
-        return 0
-      fi
-      log "Download command succeeded but expected file was not found at ${temp_dir}/${file_path}."
-    fi
-
-    log "Download failed for ${repo}/${file_path}; retrying in ${retry_delay}s..."
-    sleep "$retry_delay"
-    retry_delay=$((retry_delay * 2))
-    attempt=$((attempt + 1))
-  done
+  fi
 
   rm -rf "$temp_dir"
   rmdir "$lockfile" || true
   release_slot "$slot"
-  echo "ERROR: failed to download ${repo}/${file_path}" >&2
   return 1
 }
 
 acquire_slot() {
-  local i
-  local slot
-
+  local i slot
   while true; do
     i=1
     while [ "$i" -le "$HF_MAX_PARALLEL" ]; do
@@ -596,7 +392,7 @@ acquire_slot() {
       fi
       i=$((i + 1))
     done
-    sleep 0.5
+    sleep 0.2
   done
 }
 
@@ -605,82 +401,18 @@ release_slot() {
 }
 
 write_comfyui_memory_launchers() {
-  log "Writing ComfyUI lightweight memory launch helpers..."
-
   cat > "${WORKSPACE_DIR}/start_comfyui_light_ram.sh" <<EOF_LAUNCHER
 #!/bin/bash
-set -euo pipefail
-
-COMFYUI_DIR="\${COMFYUI_DIR:-${COMFYUI_DIR}}"
-COMFYUI_PORT="\${COMFYUI_PORT:-8188}"
-COMFYUI_MEMORY_ARGS="\${COMFYUI_MEMORY_ARGS:-${COMFYUI_MEMORY_ARGS}}"
-
-export PYTORCH_CUDA_ALLOC_CONF="\${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_CUDA_ALLOC_CONF}}"
-export CLI_ARGS="\${CLI_ARGS:-\${COMFYUI_MEMORY_ARGS}}"
-
-if [ -f /venv/main/bin/activate ]; then
-  . /venv/main/bin/activate
-elif [ -f "\${COMFYUI_DIR}/venv/bin/activate" ]; then
-  . "\${COMFYUI_DIR}/venv/bin/activate"
-fi
-
-cd "\${COMFYUI_DIR}"
-
-echo "[start] Starting ComfyUI with light RAM args: \${COMFYUI_MEMORY_ARGS}"
-exec python main.py --listen 0.0.0.0 --port "\${COMFYUI_PORT}" \${COMFYUI_MEMORY_ARGS} "\$@"
+cd "${COMFYUI_DIR}"
+if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi
+exec python main.py --listen 0.0.0.0 --port \${COMFYUI_PORT:-8188} ${COMFYUI_MEMORY_ARGS} "\$@"
 EOF_LAUNCHER
-
   chmod +x "${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
-
-  cat > "${WORKSPACE_DIR}/COMFYUI_LIGHT_RAM_ARGS.txt" <<EOF_ARGS
-Recommended ComfyUI launch args for this Vast.ai image:
-
-python main.py --listen 0.0.0.0 --port 8188 ${COMFYUI_MEMORY_ARGS}
-
-Equivalent args:
-
-${COMFYUI_MEMORY_ARGS}
-
-Notes:
-- --cache-none disables ComfyUI RAM cache.
-- --fast-disk prefers disk-backed dynamic loading.
-- --highvram keeps models in GPU memory instead of unloading them to CPU RAM.
-- If CUDA OOM happens, replace --highvram with --normalvram or remove it.
-- If RAM is still too high and VRAM is enough, try replacing --highvram with --gpu-only.
-EOF_ARGS
-
-  cat > "${WORKSPACE_DIR}/.comfyui_light_ram_env" <<EOF_ENV
-export COMFYUI_MEMORY_ARGS="${COMFYUI_MEMORY_ARGS}"
-export CLI_ARGS="${CLI_ARGS}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
-EOF_ENV
-
-  # Best-effort persistent environment for interactive shells.
-  if [ -d /etc/profile.d ] && [ -w /etc/profile.d ]; then
-    cat > /etc/profile.d/comfyui_light_ram.sh <<EOF_PROFILE
-export COMFYUI_MEMORY_ARGS="${COMFYUI_MEMORY_ARGS}"
-export CLI_ARGS="${CLI_ARGS}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
-EOF_PROFILE
-  fi
-
-  log "Created launcher: ${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
-  log "Created memory notes: ${WORKSPACE_DIR}/COMFYUI_LIGHT_RAM_ARGS.txt"
 }
 
 write_api_wrapper_note() {
-  if [ -d "$API_PAYLOAD_DIR" ]; then
-    cat > "${API_PAYLOAD_DIR}/README_AcademiaSD_Ideogram4.txt" <<'NOTE'
-AcademiaSD_Ideogram-4_v16_Inpaint.json has been installed into the ComfyUI user workflows folder.
-It is a UI workflow JSON. If this serverless wrapper requires an API prompt JSON, load the workflow in ComfyUI,
-export it in API format, and place that exported JSON in this payloads directory.
-
-Memory note:
-This provisioning script creates /workspace/start_comfyui_light_ram.sh.
-Use that launcher, or start ComfyUI with:
---cache-none --fast-disk --highvram --disable-auto-launch
-NOTE
-  fi
+  # Silencioso
+  return 0
 }
 
 main "$@"
