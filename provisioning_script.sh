@@ -10,7 +10,7 @@ CUSTOM_NODES_DIR="${CUSTOM_NODES_DIR:-${COMFYUI_DIR}/custom_nodes}"
 API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
 
-# ¡MODIFICADO! Subimos de 1 a 4 descargas concurrentes para no ir secuencial
+# ¡OPTIMIZADO! Pasamos de 1 a 4 descargas en paralelo para exprimir tus 2100 MB/s
 HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-4}"
 
 # Hugging Face token
@@ -24,16 +24,14 @@ export HF_TOKEN HF_HOME HF_HUB_ENABLE_HF_TRANSFER HF_XET_HIGH_PERFORMANCE
 UPDATE_COMFYUI="${UPDATE_COMFYUI:-1}"
 INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
 
-# Ideogram 4 remains enabled by default.
+# Ideogram 4
 DOWNLOAD_IDEOGRAM4="${DOWNLOAD_IDEOGRAM4:-1}"
 DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-0}"
 DOWNLOAD_IDEOGRAM_NVFP4="${DOWNLOAD_IDEOGRAM_NVFP4:-0}"
 
-# Vast.ai lightweight default:
+# Modelos Flux
 DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-0}"
 DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
-
-# Adonis remains enabled by default.
 DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
 DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-$DOWNLOAD_ADONIS_FLUX2KLEIN}"
 DOWNLOAD_FLUX2_KLEIN_9B_FP8="${DOWNLOAD_FLUX2_KLEIN_9B_FP8:-0}"
@@ -70,11 +68,20 @@ script_cleanup() {
 script_error() {
   local exit_code=$?
   local line_number=$1
-  echo "[ERROR] Provisioning script failed at line ${line_number} with exit code ${exit_code}" | tee -a "${MODEL_LOG:-/var/log/portal/comfyui.log}" || true
+  echo "[ERROR] El script falló en la línea ${line_number} con código de salida ${exit_code}" | tee -a "${MODEL_LOG:-/var/log/portal/comfyui.log}" || true
 }
 
 trap script_cleanup EXIT
 trap 'script_error $LINENO' ERR
+
+# Función de ayuda para usar UV si está disponible, si no hereda PIP rápido
+fast_pip() {
+  if command -v uv &> /dev/null; then
+    uv pip install --no-cache-dir "$@"
+  else
+    python -m pip install --no-cache-dir "$@"
+  fi
+}
 
 main() {
   activate_python_env
@@ -90,9 +97,8 @@ main() {
   check_workspace_free_space
   download_all_hf_models
   write_comfyui_memory_launchers
-  write_api_wrapper_note
 
-  log "Provisioning completed con éxito."
+  log "¡Provisioning completado con éxito y optimizado al máximo!"
 }
 
 activate_python_env() {
@@ -115,14 +121,12 @@ update_comfyui() {
   set -e
 
   if [ $status -ne 0 ]; then
-    log "Fallo de pull rápido; haciendo fetch forzado."
     git -C "$COMFYUI_DIR" fetch --depth 1 origin
     git -C "$COMFYUI_DIR" reset --hard origin/HEAD
   fi
 
   if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
-    # ¡OPTIMIZADO! Añadido --no-cache-dir para agilizar entornos cloud
-    python -m pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
+    fast_pip -r "${COMFYUI_DIR}/requirements.txt"
   fi
 }
 
@@ -138,7 +142,8 @@ check_workspace_free_space() {
 
 maybe_upgrade_torch_for_rtx50() {
   if [ "$UPGRADE_TORCH_FOR_RTX50" != "1" ]; then return 0; fi
-  python -m pip install --no-cache-dir --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+  log "Actualizando PyTorch..."
+  fast_pip --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
 }
 
 ensure_layout() {
@@ -149,9 +154,14 @@ ensure_layout() {
 }
 
 install_base_python_deps() {
-  log "Instalando dependencias base en modo rápido..."
-  python -m pip install --no-cache-dir --upgrade pip setuptools wheel
-  python -m pip install --no-cache-dir --upgrade \
+  log "Instalando dependencias críticas de Python con UV/PIP rápido..."
+  if command -v uv &> /dev/null; then
+    uv pip install --no-cache-dir --upgrade pip setuptools wheel
+  else
+    python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+  fi
+  
+  fast_pip --upgrade \
     huggingface_hub hf_transfer hf-xet gguf safetensors \
     accelerate transformers sentencepiece protobuf qwen-vl-utils rotary-embedding-torch
 }
@@ -168,27 +178,23 @@ clone_or_update() {
   local repo_url="$1"
   local dir_name="$2"
   local target_dir="${CUSTOM_NODES_DIR}/${dir_name}"
-  local clone_extra="${3:-}"
 
   if [ -d "${target_dir}/.git" ]; then
     git -C "$target_dir" fetch --depth 1 origin
     git -C "$target_dir" reset --hard origin/HEAD
   else
-    if [ "$clone_extra" = "recursive" ]; then
-      git clone --depth 1 --recursive "$repo_url" "$target_dir"
-    else
-      git clone --depth 1 "$repo_url" "$target_dir"
-    fi
+    # ¡MODIFICADO! Quitamos clones recursivos pesados de submódulos que ahogaban la red
+    git clone --depth 1 "$repo_url" "$target_dir"
   fi
 }
 
 clone_or_update_safe() {
-  run_maybe_nonfatal "clone/update $2" clone_or_update "$1" "$2" "${3:-}"
+  run_maybe_nonfatal "clone/update $2" clone_or_update "$1" "$2"
 }
 
 install_node_requirements() {
   if [ -f "${1}/requirements.txt" ]; then
-    python -m pip install --no-cache-dir -r "${1}/requirements.txt"
+    fast_pip -r "${1}/requirements.txt"
   fi
 }
 
@@ -215,6 +221,7 @@ dedupe_comfyui_manager() {
 }
 
 install_custom_nodes() {
+  log "Clonando nodos personalizados..."
   dedupe_comfyui_manager
   if [ "$INSTALL_COMFYUI_MANAGER" = "1" ]; then
     clone_or_update_safe "https://github.com/Comfy-Org/ComfyUI-Manager.git" "ComfyUI-Manager"
@@ -223,7 +230,7 @@ install_custom_nodes() {
 
   clone_or_update_safe "https://github.com/AcademiaSD/comfyui_AcademiaSD.git" "comfyui_AcademiaSD"
   clone_or_update_safe "https://github.com/city96/ComfyUI-GGUF.git" "ComfyUI-GGUF"
-  clone_or_update_safe "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use" "recursive"
+  clone_or_update_safe "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use"
   clone_or_update_safe "https://github.com/yanokusnir-ai/one-node-flux-2-klein.git" "one-node-flux-2-klein"
   clone_or_update_safe "https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch.git" "ComfyUI-Inpaint-CropAndStitch"
 
@@ -243,6 +250,7 @@ install_custom_nodes() {
   )
   if [ "$INSTALL_SEEDVR2" = "1" ]; then node_dirs+=("${CUSTOM_NODES_DIR}/ComfyUI-SeedVR2_VideoUpscaler"); fi
 
+  log "Instalando librerías de los nodos..."
   for nd in "${node_dirs[@]}"; do
     run_maybe_nonfatal "reqs $nd" install_node_requirements "$nd"
     run_maybe_nonfatal "script $nd" run_node_install_script "$nd"
@@ -316,7 +324,7 @@ download_all_hf_models() {
     hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
   fi
 
-  log "Descargando ${#HF_MODELS[@]} archivos de HF con descarga paralela activa (Máx: ${HF_MAX_PARALLEL})..."
+  log "Descargando ${#HF_MODELS[@]} archivos pesados con paralelismo x${HF_MAX_PARALLEL}..."
 
   local pids=()
   local model repo file_path output_path
@@ -350,7 +358,7 @@ download_hf_file() {
   mkdir -p "$(dirname "$output_path")"
 
   while ! mkdir "$lockfile" 2>/dev/null; do
-    sleep 2
+    sleep 1
   done
 
   if [ -s "$output_path" ]; then
@@ -363,7 +371,7 @@ download_hf_file() {
   local hf_token_args=()
   if [ -n "$HF_TOKEN" ]; then hf_token_args=(--token "$HF_TOKEN"); fi
 
-  log "Iniciando descarga rápida: ${repo}/${file_path}"
+  log "Descargando vía hf_transfer: ${repo}/${file_path}"
   if hf download "$repo" "$file_path" --local-dir "$temp_dir" "${hf_token_args[@]}" >/dev/null 2>&1; then
     if [ -f "${temp_dir}/${file_path}" ]; then
       mv -f "${temp_dir}/${file_path}" "$output_path"
@@ -408,11 +416,6 @@ if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi
 exec python main.py --listen 0.0.0.0 --port \${COMFYUI_PORT:-8188} ${COMFYUI_MEMORY_ARGS} "\$@"
 EOF_LAUNCHER
   chmod +x "${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
-}
-
-write_api_wrapper_note() {
-  # Silencioso
-  return 0
 }
 
 main "$@"
