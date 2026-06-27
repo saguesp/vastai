@@ -10,7 +10,7 @@ CUSTOM_NODES_DIR="${CUSTOM_NODES_DIR:-${COMFYUI_DIR}/custom_nodes}"
 API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
 
-# ¡OPTIMIZADO! Pasamos de 1 a 4 descargas en paralelo para exprimir tus 2100 MB/s
+# ¡OPTIMIZADO! Descargas simultáneas en paralelo para exprimir tus 2100 MB/s
 HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-4}"
 
 # Hugging Face token
@@ -20,21 +20,21 @@ HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 export HF_TOKEN HF_HOME HF_HUB_ENABLE_HF_TRANSFER HF_XET_HIGH_PERFORMANCE
 
-# Toggle installs/downloads.
+# Configuración de descargas (4B y Qwen 4B desactivados por petición)
 UPDATE_COMFYUI="${UPDATE_COMFYUI:-1}"
 INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
-
-# Ideogram 4
 DOWNLOAD_IDEOGRAM4="${DOWNLOAD_IDEOGRAM4:-1}"
 DOWNLOAD_IDEOGRAM4_UNCONDITIONAL="${DOWNLOAD_IDEOGRAM4_UNCONDITIONAL:-0}"
 DOWNLOAD_IDEOGRAM_NVFP4="${DOWNLOAD_IDEOGRAM_NVFP4:-0}"
 
-# Modelos Flux
-DOWNLOAD_FLUX2_KLEIN="${DOWNLOAD_FLUX2_KLEIN:-0}"
-DOWNLOAD_FLUX2_KLEIN_FP8="${DOWNLOAD_FLUX2_KLEIN_FP8:-0}"
+# Desactivados componentes 4B estándar
+DOWNLOAD_FLUX2_KLEIN="0"
+DOWNLOAD_FLUX2_KLEIN_FP8="0"
+
+# Activado ecosistema 9B y Adonis
 DOWNLOAD_ADONIS_FLUX2KLEIN="${DOWNLOAD_ADONIS_FLUX2KLEIN:-1}"
-DOWNLOAD_FLUX2_KLEIN_9B="${DOWNLOAD_FLUX2_KLEIN_9B:-$DOWNLOAD_ADONIS_FLUX2KLEIN}"
-DOWNLOAD_FLUX2_KLEIN_9B_FP8="${DOWNLOAD_FLUX2_KLEIN_9B_FP8:-0}"
+DOWNLOAD_FLUX2_KLEIN_9B="0" # Desactivado el 9B gigante normal
+DOWNLOAD_FLUX2_KLEIN_9B_FP8="1" # Forzamos el FP8 optimizado
 
 UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
 
@@ -74,7 +74,7 @@ script_error() {
 trap script_cleanup EXIT
 trap 'script_error $LINENO' ERR
 
-# Función de ayuda para usar UV si está disponible, si no hereda PIP rápido
+# Motor de instalación ultrarrápido usando UV (Rust)
 fast_pip() {
   if command -v uv &> /dev/null; then
     uv pip install --no-cache-dir "$@"
@@ -98,7 +98,7 @@ main() {
   download_all_hf_models
   write_comfyui_memory_launchers
 
-  log "¡Provisioning completado con éxito y optimizado al máximo!"
+  log "¡Provisioning completado con éxito con todos los requerimientos de One-Node Flux.2 Klein 9B!"
 }
 
 activate_python_env() {
@@ -149,12 +149,12 @@ maybe_upgrade_torch_for_rtx50() {
 ensure_layout() {
   mkdir -p "$COMFYUI_DIR" "$CUSTOM_NODES_DIR" "$WORKFLOW_DIR" \
     "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" \
-    "$MODELS_DIR/vae" "$MODELS_DIR/loras/flux2_klein" \
+    "$MODELS_DIR/vae" "$MODELS_DIR/loras" "$MODELS_DIR/background_removal" \
     "$HF_SEMAPHORE_DIR" "$HF_HOME" "$HF_STAGING_DIR"
 }
 
 install_base_python_deps() {
-  log "Instalando dependencias críticas de Python con UV/PIP rápido..."
+  log "Instalando dependencias críticas de Python..."
   if command -v uv &> /dev/null; then
     uv pip install --no-cache-dir --upgrade pip setuptools wheel
   else
@@ -183,7 +183,7 @@ clone_or_update() {
     git -C "$target_dir" fetch --depth 1 origin
     git -C "$target_dir" reset --hard origin/HEAD
   else
-    # ¡MODIFICADO! Quitamos clones recursivos pesados de submódulos que ahogaban la red
+    # Eliminados clones recursivos para que la clonación de Git vaya a toda velocidad
     git clone --depth 1 "$repo_url" "$target_dir"
   fi
 }
@@ -221,7 +221,7 @@ dedupe_comfyui_manager() {
 }
 
 install_custom_nodes() {
-  log "Clonando nodos personalizados..."
+  log "Clonando nodos personalizados necesarios..."
   dedupe_comfyui_manager
   if [ "$INSTALL_COMFYUI_MANAGER" = "1" ]; then
     clone_or_update_safe "https://github.com/Comfy-Org/ComfyUI-Manager.git" "ComfyUI-Manager"
@@ -268,6 +268,7 @@ add_hf_model() {
 
 build_model_list() {
   HF_MODELS=()
+  
   if [ "$DOWNLOAD_IDEOGRAM4" = "1" ]; then
     add_hf_model "Comfy-Org/Ideogram-4" "diffusion_models/ideogram4_fp8_scaled.safetensors" "${MODELS_DIR}/diffusion_models/ideogram4_fp8_scaled.safetensors"
     if [ "$DOWNLOAD_IDEOGRAM4_UNCONDITIONAL" = "1" ]; then
@@ -284,36 +285,29 @@ build_model_list() {
     add_hf_model "Comfy-Org/Ideogram-4" "text_encoders/qwen3vl_8b_nvfp4.safetensors" "${MODELS_DIR}/text_encoders/qwen3vl_8b_nvfp4.safetensors"
   fi
 
-  if [ "$DOWNLOAD_FLUX2_KLEIN" = "1" ]; then
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/diffusion_models/flux-2-klein-4b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-4b.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/text_encoders/qwen_3_4b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_4b.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
-  fi
-
-  if [ "$DOWNLOAD_FLUX2_KLEIN_FP8" = "1" ]; then
-    add_hf_model "black-forest-labs/FLUX.2-klein-4b-fp8" "flux-2-klein-4b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-4b-fp8.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/text_encoders/qwen_3_4b_fp4_flux2.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_4b_fp4_flux2.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-4b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
-  fi
-
-  if [ "$DOWNLOAD_FLUX2_KLEIN_9B" = "1" ]; then
-    add_hf_model "black-forest-labs/FLUX.2-klein-9B" "flux-2-klein-9b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
-  fi
-
+  # REQUERIMIENTOS EXCLUSIVOS FLUX.2 KLEIN 9B FP8
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B_FP8" = "1" ]; then
     add_hf_model "black-forest-labs/FLUX.2-klein-9b-fp8" "flux-2-klein-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
+  # REQUERIMIENTOS ADONIS LORAS
   if [ "$DOWNLOAD_ADONIS_FLUX2KLEIN" = "1" ]; then
     add_hf_model "n8te0/adonis_flux2klein" "adonis_base.safetensors" "${MODELS_DIR}/loras/adonis_base.safetensors"
     add_hf_model "n8te0/adonis_flux2klein" "adonis_post.safetensors" "${MODELS_DIR}/loras/adonis_post.safetensors"
     add_hf_model "n8te0/adonis_flux2klein" "adonis_refine.safetensors" "${MODELS_DIR}/loras/adonis_refine.safetensors"
     add_hf_model "n8te0/adonis_flux2klein" "Adonis_Workflow.json" "${WORKFLOW_DIR}/Adonis_Workflow.json"
   fi
+
+  # REQUERIMIENTOS ADICIONALES REQUERIDOS POR EL NODO ONE-NODE (Faceswap, Pose, BiRefNet)
+  log "Añadiendo recursos específicos de One-Node Flux.2 Klein..."
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "faceswap_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/faceswap_flux_klein_v1.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_9b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_9b.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_4b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_4b.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "pose_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/pose_flux_klein_v1.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "refcontrol_v2_poses_9b.safetensors" "${MODELS_DIR}/loras/refcontrol_v2_poses_9b.safetensors"
+  add_hf_model "Comfy-Org/BiRefNet" "birefnet.safetensors" "${MODELS_DIR}/background_removal/birefnet.safetensors"
 }
 
 download_all_hf_models() {
@@ -324,7 +318,7 @@ download_all_hf_models() {
     hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
   fi
 
-  log "Descargando ${#HF_MODELS[@]} archivos pesados con paralelismo x${HF_MAX_PARALLEL}..."
+  log "Descargando ${#HF_MODELS[@]} archivos pesados con paralelismo activo (Máx: ${HF_MAX_PARALLEL})..."
 
   local pids=()
   local model repo file_path output_path
@@ -413,7 +407,7 @@ write_comfyui_memory_launchers() {
 #!/bin/bash
 cd "${COMFYUI_DIR}"
 if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi
-exec python main.py --listen 0.0.0.0 --port \${COMFYUI_PORT:-8188} ${COMFYUI_MEMORY_ARGS} "\$@"
+exec python main.py --listen 0.0.0.0 --port \text{PORT:-8188} ${COMFYUI_MEMORY_ARGS} "\$@"
 EOF_LAUNCHER
   chmod +x "${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
 }
