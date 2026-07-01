@@ -1,0 +1,400 @@
+#!/bin/bash
+set -euo pipefail
+
+### Configuration ###
+WORKSPACE_DIR="${WORKSPACE:-/workspace}"
+COMFYUI_DIR="${COMFYUI_DIR:-${WORKSPACE_DIR}/ComfyUI}"
+MODELS_DIR="${MODELS_DIR:-${COMFYUI_DIR}/models}"
+WORKFLOW_DIR="${WORKFLOW_DIR:-${COMFYUI_DIR}/user/default/workflows}"
+CUSTOM_NODES_DIR="${CUSTOM_NODES_DIR:-${COMFYUI_DIR}/custom_nodes}"
+API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
+HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
+
+# Descargas simultáneas en paralelo
+HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-4}"
+
+# Hugging Face token (Mantenido intacto en modo lectura)
+HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-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}}"
+HF_HOME="${HF_HOME:-${WORKSPACE_DIR}/.cache/huggingface}"
+HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+export HF_TOKEN HF_HOME HF_HUB_ENABLE_HF_TRANSFER HF_XET_HIGH_PERFORMANCE
+
+# Configuración de descargas optimizada
+UPDATE_COMFYUI="${UPDATE_COMFYUI:-1}"
+INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
+DOWNLOAD_FLUX2_KLEIN_9B_FP8="1"
+
+UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
+
+if [ -z "${COMFYUI_MEMORY_ARGS:-}" ]; then
+  COMFYUI_MEMORY_ARGS="--cache-none --fast-disk --highvram --disable-auto-launch"
+fi
+
+CLI_ARGS="${CLI_ARGS:-$COMFYUI_MEMORY_ARGS}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export COMFYUI_MEMORY_ARGS CLI_ARGS PYTORCH_CUDA_ALLOC_CONF
+
+SKIP_CUSTOM_NODE_ERRORS="${SKIP_CUSTOM_NODE_ERRORS:-1}"
+REQUIRED_FREE_GB="${REQUIRED_FREE_GB:-50}"
+HF_STAGING_DIR="${HF_STAGING_DIR:-${WORKSPACE_DIR}/.hf_downloads}"
+
+declare -a HF_MODELS=()
+### End Configuration ###
+
+log() {
+  echo "[provision] $*"
+}
+
+script_cleanup() {
+  rm -rf "$HF_SEMAPHORE_DIR"
+}
+
+script_error() {
+  local exit_code=$?
+  local line_number=$1
+  echo "[ERROR] El script falló en la línea ${line_number} con código de salida ${exit_code}" | tee -a "${MODEL_LOG:-/var/log/portal/comfyui.log}" || true
+}
+
+trap script_cleanup EXIT
+trap 'script_error $LINENO' ERR
+
+# Motor de instalación rápido usando UV o Pip
+fast_pip() {
+  if command -v uv &> /dev/null; then
+    uv pip install --no-cache-dir "$@"
+  else
+    python -m pip install --no-cache-dir "$@"
+  fi
+}
+
+main() {
+  activate_python_env
+  ensure_layout
+  update_comfyui
+  install_base_python_deps
+  maybe_upgrade_torch_for_rtx50
+
+  download_workflows
+  install_custom_nodes
+  
+  # Instalar Ollama e inyectar modelos NSFW / Uncensored
+  install_and_setup_ollama
+
+  build_model_list
+  check_workspace_free_space
+  download_all_hf_models
+  write_comfyui_memory_launchers
+
+  log "¡Provisioning completado! Listo para usar con One-Node Flux, NKD Klein Tools y Ollama NSFW."
+}
+
+activate_python_env() {
+  if [ -f /venv/main/bin/activate ]; then
+    . /venv/main/bin/activate
+  elif [ -f "${COMFYUI_DIR}/venv/bin/activate" ]; then
+    . "${COMFYUI_DIR}/venv/bin/activate"
+  fi
+}
+
+update_comfyui() {
+  if [ "$UPDATE_COMFYUI" != "1" ] || [ ! -d "${COMFYUI_DIR}/.git" ]; then
+    return 0
+  fi
+
+  log "Actualizando ComfyUI core..."
+  set +e
+  git -C "$COMFYUI_DIR" pull --ff-only
+  local status=$?
+  set -e
+
+  if [ $status -ne 0 ]; then
+    git -C "$COMFYUI_DIR" fetch --depth 1 origin
+    git -C "$COMFYUI_DIR" reset --hard origin/HEAD
+  fi
+
+  if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
+    fast_pip -r "${COMFYUI_DIR}/requirements.txt"
+  fi
+}
+
+check_workspace_free_space() {
+  if [ "${REQUIRED_FREE_GB}" = "0" ]; then return 0; fi
+  local free_gb
+  free_gb=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+  free_gb="${free_gb:-0}"
+  if [ "$free_gb" -lt "$REQUIRED_FREE_GB" ]; then
+    return 1
+  fi
+}
+
+maybe_upgrade_torch_for_rtx50() {
+  if [ "$UPGRADE_TORCH_FOR_RTX50" != "1" ]; then return 0; fi
+  log "Actualizando PyTorch..."
+  fast_pip --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+}
+
+ensure_layout() {
+  mkdir -p "$WORKSPACE_DIR" "$COMFYUI_DIR" "$CUSTOM_NODES_DIR" "$WORKFLOW_DIR" \
+    "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" \
+    "$MODELS_DIR/vae" "$MODELS_DIR/loras" "$MODELS_DIR/background_removal" \
+    "$HF_SEMAPHORE_DIR" "$HF_HOME" "$HF_STAGING_DIR"
+}
+
+install_base_python_deps() {
+  log "Instalando dependencias críticas de Python..."
+  if command -v uv &> /dev/null; then
+    uv pip install --no-cache-dir --upgrade pip setuptools wheel
+  else
+    python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+  fi
+  
+  fast_pip --upgrade \
+    huggingface_hub hf_transfer hf-xet gguf safetensors \
+    accelerate transformers sentencepiece protobuf qwen-vl-utils rotary-embedding-torch
+}
+
+run_maybe_nonfatal() {
+  local description="$1"
+  shift
+  if "$@"; then return 0; fi
+  if [ "$SKIP_CUSTOM_NODE_ERRORS" = "1" ]; then return 0; fi
+  return 1
+}
+
+clone_or_update() {
+  local repo_url="$1"
+  local dir_name="$2"
+  local target_dir="${CUSTOM_NODES_DIR}/${dir_name}"
+
+  if [ -d "${target_dir}/.git" ]; then
+    git -C "$target_dir" fetch --depth 1 origin
+    git -C "$target_dir" reset --hard origin/HEAD
+  else
+    git clone --depth 1 "$repo_url" "$target_dir"
+  fi
+}
+
+clone_or_update_safe() {
+  run_maybe_nonfatal "clone/update $2" clone_or_update "$1" "$2"
+}
+
+install_node_requirements() {
+  if [ -f "${1}/requirements.txt" ]; then
+    fast_pip -r "${1}/requirements.txt"
+  fi
+}
+
+run_node_install_script() {
+  if [ -f "${1}/install.py" ]; then
+    python "${1}/install.py"
+  elif [ -f "${1}/install.sh" ]; then
+    bash "${1}/install.sh"
+  fi
+}
+
+disable_custom_node_if_present() {
+  local src_dir="${CUSTOM_NODES_DIR}/${1}"
+  if [ -d "$src_dir" ]; then
+    mkdir -p "${COMFYUI_DIR}/custom_nodes_disabled"
+    mv "$src_dir" "${COMFYUI_DIR}/custom_nodes_disabled/${1}_$(date +%Y%m%d_%H%M%S)"
+  fi
+}
+
+dedupe_comfyui_manager() {
+  if [ -d "${CUSTOM_NODES_DIR}/ComfyUI-Manager" ] && [ -d "${CUSTOM_NODES_DIR}/comfyui-manager" ]; then
+    disable_custom_node_if_present "comfyui-manager"
+  fi
+}
+
+install_custom_nodes() {
+  log "Clonando nodos personalizados necesarios..."
+  dedupe_comfyui_manager
+  if [ "$INSTALL_COMFYUI_MANAGER" = "1" ]; then
+    clone_or_update_safe "https://github.com/Comfy-Org/ComfyUI-Manager.git" "ComfyUI-Manager"
+    dedupe_comfyui_manager
+  fi
+
+  # Nodos esenciales requeridos e integración con Ollama
+  clone_or_update_safe "https://github.com/city96/ComfyUI-GGUF.git" "ComfyUI-GGUF"
+  clone_or_update_safe "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use"
+  clone_or_update_safe "https://github.com/yanokusnir-ai/one-node-flux-2-klein.git" "one-node-flux-2-klein"
+  clone_or_update_safe "https://github.com/Nekodificador/ComfyUI-NKD-Klein-Tools.git" "ComfyUI-NKD-Klein-Tools"
+  clone_or_update_safe "https://github.com/cubiq/ComfyUI-Ollama.git" "ComfyUI-Ollama"
+
+  local node_dirs=(
+    "${CUSTOM_NODES_DIR}/ComfyUI-Manager"
+    "${CUSTOM_NODES_DIR}/ComfyUI-GGUF"
+    "${CUSTOM_NODES_DIR}/ComfyUI-Easy-Use"
+    "${CUSTOM_NODES_DIR}/one-node-flux-2-klein"
+    "${CUSTOM_NODES_DIR}/ComfyUI-NKD-Klein-Tools"
+    "${CUSTOM_NODES_DIR}/ComfyUI-Ollama"
+  )
+
+  log "Instalando librerías de los nodos..."
+  for nd in "${node_dirs[@]}"; do
+    run_maybe_nonfatal "reqs $nd" install_node_requirements "$nd"
+    run_maybe_nonfatal "script $nd" run_node_install_script "$nd"
+  done
+}
+
+install_and_setup_ollama() {
+  log "Instalando Ollama local de forma silenciosa..."
+  curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1 || true
+
+  log "Iniciando servicio de Ollama en segundo plano..."
+  # Guardamos logs del backend en la partición persistente por si acaso
+  ollama serve > "${WORKSPACE_DIR}/ollama.log" 2>&1 &
+  
+  # Esperar a que el socket de Ollama responda antes de continuar
+  log "Esperando a que Ollama responda en el puerto 11434..."
+  local timeout=30
+  while ! curl -s http://127.0.0.1:11434/api/tags >/dev/null && [ "$timeout" -gt 0 ]; do
+    sleep 1
+    timeout=$((timeout - 1))
+  done
+
+  # Descarga de modelos locales sin censura (Uncensored / NSFW friendly)
+  log "Descargando moondream:v2 (VLM Sin Censura)..."
+  ollama pull moondream:v2 >/dev/null 2>&1 || true
+
+  log "Descargando dolphin-2.9.2-qwen2:7b (LLM Uncensored/NSFW optimizado para Klein)..."
+  ollama pull dolphin-2.9.2-qwen2:7b >/dev/null 2>&1 || true
+}
+
+download_workflows() {
+  mkdir -p "$WORKFLOW_DIR"
+}
+
+add_hf_model() {
+  HF_MODELS+=("${1}|${2}|${3}")
+}
+
+build_model_list() {
+  HF_MODELS=()
+  
+  # REQUERIMIENTOS EXCLUSIVOS FLUX.2 KLEIN 9B FP8
+  if [ "$DOWNLOAD_FLUX2_KLEIN_9B_FP8" = "1" ]; then
+    add_hf_model "black-forest-labs/FLUX.2-klein-9b-fp8" "flux-2-klein-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors"
+    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
+  fi
+
+  # REQUERIMIENTOS ADICIONALES REQUERIDOS POR EL NODO ONE-NODE (Faceswap, Pose, BiRefNet)
+  log "Añadiendo recursos específicos de One-Node Flux.2 Klein..."
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "faceswap_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/faceswap_flux_klein_v1.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_9b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_9b.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_4b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_4b.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "pose_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/pose_flux_klein_v1.safetensors"
+  add_hf_model "yanokusnir/flux-2-klein-one-node" "refcontrol_v2_poses_9b.safetensors" "${MODELS_DIR}/loras/refcontrol_v2_poses_9b.safetensors"
+  add_hf_model "Comfy-Org/BiRefNet" "birefnet.safetensors" "${MODELS_DIR}/background_removal/birefnet.safetensors"
+}
+
+download_all_hf_models() {
+  if [ "${#HF_MODELS[@]}" -eq 0 ]; then return 0; fi
+  mkdir -p "$HF_STAGING_DIR"
+
+  if [ -n "$HF_TOKEN" ]; then
+    hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
+  fi
+
+  log "Descargando ${#HF_MODELS[@]} archivos pesados con paralelismo activo (Máx: ${HF_MAX_PARALLEL})..."
+
+  local pids=()
+  local model repo file_path output_path
+
+  for model in "${HF_MODELS[@]}"; do
+    repo="${model%%|*}"
+    file_path="${model#*|}"
+    file_path="${file_path%%|*}"
+    output_path="${model##*|}"
+    download_hf_file "$repo" "$file_path" "$output_path" &
+    pids+=("$!")
+  done
+
+  local failed=0
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then failed=1; fi
+  done
+
+  if [ "$failed" -ne 0 ]; then return 1; fi
+}
+
+download_hf_file() {
+  local repo="$1"
+  local file_path="$2"
+  local output_path="$3"
+  local lockfile="${output_path}.lock"
+  local slot
+  local temp_dir
+
+  slot=$(acquire_slot)
+  mkdir -p "$(dirname "$output_path")"
+
+  while ! mkdir "$lockfile" 2>/dev/null; do
+    sleep 1
+  done
+
+  if [ -s "$output_path" ]; then
+    rmdir "$lockfile" || true
+    release_slot "$slot"
+    return 0
+  fi
+
+  temp_dir=$(mktemp -d "${HF_STAGING_DIR}/download.XXXXXX")
+  local hf_token_args=()
+  if [ -n "$HF_TOKEN" ]; then hf_token_args=(--token "$HF_TOKEN"); fi
+
+  log "Descargando vía hf_transfer: ${repo}/${file_path}"
+  if hf download "$repo" "$file_path" --local-dir "$temp_dir" "${hf_token_args[@]}" >/dev/null 2>&1; then
+    if [ -f "${temp_dir}/${file_path}" ]; then
+      mv -f "${temp_dir}/${file_path}" "$output_path"
+      rm -rf "$temp_dir"
+      rmdir "$lockfile" || true
+      release_slot "$slot"
+      return 0
+    fi
+  fi
+
+  rm -rf "$temp_dir"
+  rmdir "$lockfile" || true
+  release_slot "$slot"
+  return 1
+}
+
+acquire_slot() {
+  local i slot
+  while true; do
+    i=1
+    while [ "$i" -le "$HF_MAX_PARALLEL" ]; do
+      slot="${HF_SEMAPHORE_DIR}/slot_${i}"
+      if mkdir "$slot" 2>/dev/null; then
+        echo "$slot"
+        return 0
+      fi
+      i=$((i + 1))
+    done
+    sleep 0.2
+  done
+}
+
+release_slot() {
+  rmdir "$1" 2>/dev/null || rm -rf "$1"
+}
+
+write_comfyui_memory_launchers() {
+  cat > "${WORKSPACE_DIR}/start_comfyui_light_ram.sh" <<EOF_LAUNCHER
+#!/bin/bash
+# Forzar levantar el servicio de ollama al arrancar la instancia si se hubiera parado
+if ! pidof ollama >/dev/null; then
+  ollama serve > "${WORKSPACE_DIR}/ollama.log" 2>&1 &
+  sleep 3
+fi
+cd "${COMFYUI_DIR}"
+if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi
+exec python main.py --listen 0.0.0.0 --port \${PORT:-8188} \${COMFYUI_MEMORY_ARGS} "\$@"
+EOF_LAUNCHER
+  chmod +x "${WORKSPACE_DIR}/start_comfyui_light_ram.sh"
+}
+
+main "$@"
