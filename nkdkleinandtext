@@ -9,21 +9,55 @@ WORKFLOW_DIR="${WORKFLOW_DIR:-${COMFYUI_DIR}/user/default/workflows}"
 CUSTOM_NODES_DIR="${CUSTOM_NODES_DIR:-${COMFYUI_DIR}/custom_nodes}"
 API_PAYLOAD_DIR="${API_PAYLOAD_DIR:-/opt/comfyui-api-wrapper/payloads}"
 HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
+SCRIPT_LOG="${SCRIPT_LOG:-${WORKSPACE_DIR}/provisioning_script.log}"
+HF_FAILURE_REPORT="${HF_FAILURE_REPORT:-${WORKSPACE_DIR}/hf_download_failures.txt}"
 
-# Descargas simultáneas en paralelo
-HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-4}"
+# Descargas simultáneas en paralelo. 2 es más estable con modelos grandes, Xet y hf_transfer.
+HF_MAX_PARALLEL="${HF_MAX_PARALLEL:-2}"
 
-# Hugging Face token (Mantenido intacto en modo lectura)
+# Hugging Face token (Mantenido intacto en modo lectura).
+# Un token read-only sirve para descargar, pero la cuenta debe tener aceptados los términos
+# de los repositorios gated (por ejemplo FLUX.2 klein 9B).
 HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-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}}"
+HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-$HF_TOKEN}"
 HF_HOME="${HF_HOME:-${WORKSPACE_DIR}/.cache/huggingface}"
 HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
-export HF_TOKEN HF_HOME HF_HUB_ENABLE_HF_TRANSFER HF_XET_HIGH_PERFORMANCE
+HF_DOWNLOAD_RETRIES="${HF_DOWNLOAD_RETRIES:-2}"
+ALLOW_HF_DOWNLOAD_FAILURES="${ALLOW_HF_DOWNLOAD_FAILURES:-1}"
+GIT_TERMINAL_PROMPT=0
+export HF_TOKEN HUGGING_FACE_HUB_TOKEN HF_HOME HF_HUB_ENABLE_HF_TRANSFER HF_XET_HIGH_PERFORMANCE GIT_TERMINAL_PROMPT
 
 # Configuración de descargas optimizada
 UPDATE_COMFYUI="${UPDATE_COMFYUI:-1}"
 INSTALL_COMFYUI_MANAGER="${INSTALL_COMFYUI_MANAGER:-1}"
-DOWNLOAD_FLUX2_KLEIN_9B_FP8="1"
+INSTALL_KJ_NODES="${INSTALL_KJ_NODES:-1}"
+INSTALL_NKD_KLEIN_TOOLS="${INSTALL_NKD_KLEIN_TOOLS:-1}"
+INSTALL_NKD_PREVIEW_TOOLS="${INSTALL_NKD_PREVIEW_TOOLS:-1}"
+INSTALL_OLLAMA_NODE="${INSTALL_OLLAMA_NODE:-1}"
+INSTALL_CUSTOM_SCRIPTS="${INSTALL_CUSTOM_SCRIPTS:-1}"
+
+# Estos extras no los requiere el workflow adjunto; quedan como opt-in.
+INSTALL_GGUF_NODE="${INSTALL_GGUF_NODE:-0}"
+INSTALL_EASY_USE="${INSTALL_EASY_USE:-0}"
+INSTALL_ONE_NODE_FLUX_KLEIN="${INSTALL_ONE_NODE_FLUX_KLEIN:-0}"
+DOWNLOAD_ONE_NODE_EXTRAS="${DOWNLOAD_ONE_NODE_EXTRAS:-0}"
+
+DOWNLOAD_FLUX2_KLEIN_9B_FP8="${DOWNLOAD_FLUX2_KLEIN_9B_FP8:-1}"
+INSTALL_NKD_KLEIN_WORKFLOW="${INSTALL_NKD_KLEIN_WORKFLOW:-1}"
+
+# IA local para analizar imágenes y devolver prompts Klein.
+INSTALL_OLLAMA="${INSTALL_OLLAMA:-1}"
+PULL_OLLAMA_MODELS="${PULL_OLLAMA_MODELS:-1}"
+OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-qwen2.5vl:7b}"
+OLLAMA_VISION_FALLBACK_MODEL="${OLLAMA_VISION_FALLBACK_MODEL:-moondream:latest}"
+# Dolphin se usa como LLM de texto para reescribir/optimizar el prompt generado por el VLM.
+# Intentamos primero el Dolphin basado en Qwen solicitado; si Ollama no lo encuentra, usamos Dolphin Llama 3 oficial como fallback.
+OLLAMA_DOLPHIN_MODEL="${OLLAMA_DOLPHIN_MODEL:-${OLLAMA_TEXT_MODEL:-dolphin-2.9.2-qwen2:7b}}"
+OLLAMA_DOLPHIN_FALLBACK_MODEL="${OLLAMA_DOLPHIN_FALLBACK_MODEL:-dolphin-llama3:8b}"
+OLLAMA_EXTRA_MODELS="${OLLAMA_EXTRA_MODELS:-}"
+OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+export OLLAMA_HOST OLLAMA_VISION_MODEL OLLAMA_VISION_FALLBACK_MODEL OLLAMA_DOLPHIN_MODEL OLLAMA_DOLPHIN_FALLBACK_MODEL OLLAMA_EXTRA_MODELS
 
 UPGRADE_TORCH_FOR_RTX50="${UPGRADE_TORCH_FOR_RTX50:-0}"
 
@@ -44,6 +78,8 @@ declare -a HF_MODELS=()
 
 log() {
   echo "[provision] $*"
+  mkdir -p "$(dirname "$SCRIPT_LOG")" 2>/dev/null || true
+  printf '[provision] %s\n' "$*" >> "$SCRIPT_LOG" 2>/dev/null || true
 }
 
 script_cleanup() {
@@ -54,6 +90,7 @@ script_error() {
   local exit_code=$?
   local line_number=$1
   echo "[ERROR] El script falló en la línea ${line_number} con código de salida ${exit_code}" | tee -a "${MODEL_LOG:-/var/log/portal/comfyui.log}" || true
+  echo "[ERROR] Revisa también: ${SCRIPT_LOG} y ${HF_FAILURE_REPORT}" | tee -a "${MODEL_LOG:-/var/log/portal/comfyui.log}" || true
 }
 
 trap script_cleanup EXIT
@@ -71,6 +108,12 @@ fast_pip() {
 main() {
   activate_python_env
   ensure_layout
+  : > "$HF_FAILURE_REPORT"
+  if [ -n "$HF_TOKEN" ]; then
+    log "HF_TOKEN disponible para descargas (valor oculto; compatible con token read-only)."
+  else
+    log "AVISO: HF_TOKEN vacío; los repositorios privados/gated fallarán."
+  fi
   update_comfyui
   install_base_python_deps
   maybe_upgrade_torch_for_rtx50
@@ -78,15 +121,17 @@ main() {
   download_workflows
   install_custom_nodes
   
-  # Instalar Ollama e inyectar modelos NSFW / Uncensored
+  # Instalar Ollama y modelos de visión para generar prompts desde imágenes.
   install_and_setup_ollama
 
   build_model_list
   check_workspace_free_space
   download_all_hf_models
+  create_model_aliases
+  write_ollama_prompt_helper
   write_comfyui_memory_launchers
 
-  log "¡Provisioning completado! Listo para usar con One-Node Flux, NKD Klein Tools y Ollama NSFW."
+  log "¡Provisioning completado! Workflow NKD Klein listo con nodos correctos y opción de IA local para analizar imágenes."
 }
 
 activate_python_env() {
@@ -109,8 +154,15 @@ update_comfyui() {
   set -e
 
   if [ $status -ne 0 ]; then
+    log "ComfyUI está en detached HEAD o no puede hacer pull limpio; usando fetch + reset seguro."
     git -C "$COMFYUI_DIR" fetch --depth 1 origin
-    git -C "$COMFYUI_DIR" reset --hard origin/HEAD
+    local remote_head
+    remote_head=$(git -C "$COMFYUI_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [ -n "$remote_head" ]; then
+      git -C "$COMFYUI_DIR" reset --hard "$remote_head"
+    else
+      git -C "$COMFYUI_DIR" reset --hard FETCH_HEAD
+    fi
   fi
 
   if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
@@ -124,8 +176,10 @@ check_workspace_free_space() {
   free_gb=$(df -BG "$WORKSPACE_DIR" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
   free_gb="${free_gb:-0}"
   if [ "$free_gb" -lt "$REQUIRED_FREE_GB" ]; then
+    log "ERROR: espacio libre insuficiente en ${WORKSPACE_DIR}: ${free_gb}GB disponibles, ${REQUIRED_FREE_GB}GB requeridos."
     return 1
   fi
+  log "Espacio libre OK en ${WORKSPACE_DIR}: ${free_gb}GB disponibles."
 }
 
 maybe_upgrade_torch_for_rtx50() {
@@ -138,6 +192,7 @@ ensure_layout() {
   mkdir -p "$WORKSPACE_DIR" "$COMFYUI_DIR" "$CUSTOM_NODES_DIR" "$WORKFLOW_DIR" \
     "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" \
     "$MODELS_DIR/vae" "$MODELS_DIR/loras" "$MODELS_DIR/background_removal" \
+    "$MODELS_DIR/diffusion_models/FLUX2" "$WORKSPACE_DIR/prompt_helpers" \
     "$HF_SEMAPHORE_DIR" "$HF_HOME" "$HF_STAGING_DIR"
 }
 
@@ -158,8 +213,13 @@ run_maybe_nonfatal() {
   local description="$1"
   shift
   if "$@"; then return 0; fi
-  if [ "$SKIP_CUSTOM_NODE_ERRORS" = "1" ]; then return 0; fi
-  return 1
+  local status=$?
+  log "AVISO: fallo en ${description} (exit ${status})."
+  if [ "$SKIP_CUSTOM_NODE_ERRORS" = "1" ]; then
+    log "Continuando porque SKIP_CUSTOM_NODE_ERRORS=1."
+    return 0
+  fi
+  return "$status"
 }
 
 clone_or_update() {
@@ -167,9 +227,26 @@ clone_or_update() {
   local dir_name="$2"
   local target_dir="${CUSTOM_NODES_DIR}/${dir_name}"
 
+  if ! git ls-remote --exit-code "$repo_url" HEAD >/dev/null 2>&1; then
+    log "AVISO: repo no accesible sin credenciales, se omite ${dir_name}: ${repo_url}"
+    return 1
+  fi
+
+  if [ -e "$target_dir" ] && [ ! -d "${target_dir}/.git" ]; then
+    log "AVISO: ${target_dir} existe pero no es un repo git; se mueve a custom_nodes_disabled."
+    mkdir -p "${COMFYUI_DIR}/custom_nodes_disabled"
+    mv "$target_dir" "${COMFYUI_DIR}/custom_nodes_disabled/${dir_name}_nongit_$(date +%Y%m%d_%H%M%S)"
+  fi
+
   if [ -d "${target_dir}/.git" ]; then
     git -C "$target_dir" fetch --depth 1 origin
-    git -C "$target_dir" reset --hard origin/HEAD
+    local remote_head
+    remote_head=$(git -C "$target_dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [ -n "$remote_head" ]; then
+      git -C "$target_dir" reset --hard "$remote_head"
+    else
+      git -C "$target_dir" reset --hard FETCH_HEAD
+    fi
   else
     git clone --depth 1 "$repo_url" "$target_dir"
   fi
@@ -208,62 +285,325 @@ dedupe_comfyui_manager() {
 }
 
 install_custom_nodes() {
-  log "Clonando nodos personalizados necesarios..."
+  log "Clonando nodos personalizados requeridos por el workflow NKD Klein..."
   dedupe_comfyui_manager
+
+  # Evitar repos antiguos o erróneos que pueden duplicar nodos o pedir credenciales.
+  if [ -d "${CUSTOM_NODES_DIR}/ComfyUI-Ollama" ] && [ ! -d "${CUSTOM_NODES_DIR}/comfyui-ollama/.git" ]; then
+    disable_custom_node_if_present "ComfyUI-Ollama"
+  fi
+  if [ -d "${CUSTOM_NODES_DIR}/comfyui-nkd-popup-preview" ] && [ ! -d "${CUSTOM_NODES_DIR}/ComfyUI-NKD-Preview-Tools/.git" ]; then
+    disable_custom_node_if_present "comfyui-nkd-popup-preview"
+  fi
+
   if [ "$INSTALL_COMFYUI_MANAGER" = "1" ]; then
     clone_or_update_safe "https://github.com/Comfy-Org/ComfyUI-Manager.git" "ComfyUI-Manager"
     dedupe_comfyui_manager
   fi
 
-  # Nodos esenciales requeridos e integración con Ollama
-  clone_or_update_safe "https://github.com/city96/ComfyUI-GGUF.git" "ComfyUI-GGUF"
-  clone_or_update_safe "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use"
-  clone_or_update_safe "https://github.com/yanokusnir-ai/one-node-flux-2-klein.git" "one-node-flux-2-klein"
-  clone_or_update_safe "https://github.com/Nekodificador/ComfyUI-NKD-Klein-Tools.git" "ComfyUI-NKD-Klein-Tools"
-  clone_or_update_safe "https://github.com/cubiq/ComfyUI-Ollama.git" "ComfyUI-Ollama"
+  if [ "$INSTALL_KJ_NODES" = "1" ]; then
+    clone_or_update_safe "https://github.com/kijai/ComfyUI-KJNodes.git" "ComfyUI-KJNodes"
+  fi
+  if [ "$INSTALL_NKD_KLEIN_TOOLS" = "1" ]; then
+    clone_or_update_safe "https://github.com/Nekodificador/ComfyUI-NKD-Klein-Tools.git" "ComfyUI-NKD-Klein-Tools"
+  fi
+  if [ "$INSTALL_NKD_PREVIEW_TOOLS" = "1" ]; then
+    clone_or_update_safe "https://github.com/Nekodificador/ComfyUI-NKD-Preview-Tools.git" "ComfyUI-NKD-Preview-Tools"
+  fi
+  if [ "$INSTALL_OLLAMA_NODE" = "1" ]; then
+    clone_or_update_safe "https://github.com/stavsap/comfyui-ollama.git" "comfyui-ollama"
+  fi
+  if [ "$INSTALL_CUSTOM_SCRIPTS" = "1" ]; then
+    clone_or_update_safe "https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git" "ComfyUI-Custom-Scripts"
+  fi
+
+  # Extras opcionales. No son necesarios para el workflow adjunto.
+  if [ "$INSTALL_GGUF_NODE" = "1" ]; then
+    clone_or_update_safe "https://github.com/city96/ComfyUI-GGUF.git" "ComfyUI-GGUF"
+  fi
+  if [ "$INSTALL_EASY_USE" = "1" ]; then
+    clone_or_update_safe "https://github.com/yolain/ComfyUI-Easy-Use.git" "ComfyUI-Easy-Use"
+  fi
+  if [ "$INSTALL_ONE_NODE_FLUX_KLEIN" = "1" ]; then
+    clone_or_update_safe "https://github.com/yanokusnir-ai/one-node-flux-2-klein.git" "one-node-flux-2-klein"
+  fi
 
   local node_dirs=(
     "${CUSTOM_NODES_DIR}/ComfyUI-Manager"
+    "${CUSTOM_NODES_DIR}/ComfyUI-KJNodes"
+    "${CUSTOM_NODES_DIR}/ComfyUI-NKD-Klein-Tools"
+    "${CUSTOM_NODES_DIR}/ComfyUI-NKD-Preview-Tools"
+    "${CUSTOM_NODES_DIR}/comfyui-ollama"
+    "${CUSTOM_NODES_DIR}/ComfyUI-Custom-Scripts"
     "${CUSTOM_NODES_DIR}/ComfyUI-GGUF"
     "${CUSTOM_NODES_DIR}/ComfyUI-Easy-Use"
     "${CUSTOM_NODES_DIR}/one-node-flux-2-klein"
-    "${CUSTOM_NODES_DIR}/ComfyUI-NKD-Klein-Tools"
-    "${CUSTOM_NODES_DIR}/ComfyUI-Ollama"
   )
 
-  log "Instalando librerías de los nodos..."
+  log "Instalando librerías de los nodos presentes..."
   for nd in "${node_dirs[@]}"; do
+    [ -d "$nd" ] || continue
     run_maybe_nonfatal "reqs $nd" install_node_requirements "$nd"
     run_maybe_nonfatal "script $nd" run_node_install_script "$nd"
   done
 }
 
+pull_ollama_model() {
+  local model="$1"
+  local description="${2:-modelo Ollama}"
+  if [ -z "$model" ]; then
+    return 1
+  fi
+  log "Descargando ${description}: ${model}"
+  if ollama pull "$model" >>"${WORKSPACE_DIR}/ollama.log" 2>&1; then
+    return 0
+  fi
+  log "AVISO: no se pudo descargar ${model}. Revisa ${WORKSPACE_DIR}/ollama.log."
+  return 1
+}
+
+remember_prompt_refiner_model() {
+  local model="$1"
+  if [ -n "$model" ]; then
+    printf '%s
+' "$model" > "${WORKSPACE_DIR}/.ollama_prompt_refiner_model"
+  fi
+}
+
 install_and_setup_ollama() {
+  if [ "$INSTALL_OLLAMA" != "1" ]; then
+    log "Ollama desactivado por INSTALL_OLLAMA=0."
+    return 0
+  fi
+
   log "Instalando Ollama local de forma silenciosa..."
   curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1 || true
 
+  if ! command -v ollama >/dev/null 2>&1; then
+    log "AVISO: ollama no está disponible tras la instalación; se omiten modelos IA locales."
+    return 0
+  fi
+
   log "Iniciando servicio de Ollama en segundo plano..."
-  # Guardamos logs del backend en la partición persistente por si acaso
-  ollama serve > "${WORKSPACE_DIR}/ollama.log" 2>&1 &
-  
-  # Esperar a que el socket de Ollama responda antes de continuar
-  log "Esperando a que Ollama responda en el puerto 11434..."
-  local timeout=30
-  while ! curl -s http://127.0.0.1:11434/api/tags >/dev/null && [ "$timeout" -gt 0 ]; do
+  if ! curl -s "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+    ollama serve > "${WORKSPACE_DIR}/ollama.log" 2>&1 &
+  fi
+
+  log "Esperando a que Ollama responda en ${OLLAMA_HOST}..."
+  local timeout=60
+  while ! curl -s "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && [ "$timeout" -gt 0 ]; do
     sleep 1
     timeout=$((timeout - 1))
   done
 
-  # Descarga de modelos locales sin censura (Uncensored / NSFW friendly)
-  log "Descargando moondream:v2 (VLM Sin Censura)..."
-  ollama pull moondream:v2 >/dev/null 2>&1 || true
+  if ! curl -s "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+    log "AVISO: Ollama no respondió; ComfyUI arrancará igualmente. Revisa ${WORKSPACE_DIR}/ollama.log."
+    return 0
+  fi
 
-  log "Descargando dolphin-2.9.2-qwen2:7b (LLM Uncensored/NSFW optimizado para Klein)..."
-  ollama pull dolphin-2.9.2-qwen2:7b >/dev/null 2>&1 || true
+  if [ "$PULL_OLLAMA_MODELS" != "1" ]; then
+    log "PULL_OLLAMA_MODELS=0; no se descargan modelos Ollama."
+    return 0
+  fi
+
+  pull_ollama_model "$OLLAMA_VISION_MODEL" "modelo de visión principal para analizar imágenes" || true
+  pull_ollama_model "$OLLAMA_VISION_FALLBACK_MODEL" "modelo de visión ligero de reserva" || true
+
+  if pull_ollama_model "$OLLAMA_DOLPHIN_MODEL" "modelo Dolphin para reescritura de prompts"; then
+    remember_prompt_refiner_model "$OLLAMA_DOLPHIN_MODEL"
+  elif pull_ollama_model "$OLLAMA_DOLPHIN_FALLBACK_MODEL" "modelo Dolphin fallback para reescritura de prompts"; then
+    remember_prompt_refiner_model "$OLLAMA_DOLPHIN_FALLBACK_MODEL"
+  else
+    log "AVISO: no hay modelo Dolphin disponible; se mantiene solo el análisis visual."
+  fi
+
+  if [ -n "$OLLAMA_EXTRA_MODELS" ]; then
+    local extra_model
+    for extra_model in $OLLAMA_EXTRA_MODELS; do
+      pull_ollama_model "$extra_model" "modelo Ollama extra" || true
+    done
+  fi
 }
 
 download_workflows() {
   mkdir -p "$WORKFLOW_DIR"
+  if [ "$INSTALL_NKD_KLEIN_WORKFLOW" != "1" ]; then
+    return 0
+  fi
+
+  local workflow_file="${WORKFLOW_DIR}/NKD_Klein_Tools.json"
+  if [ -s "$workflow_file" ]; then
+    log "Workflow ya existe: $workflow_file"
+    return 0
+  fi
+
+  log "Instalando workflow NKD Klein Tools adjunto en $workflow_file"
+  cat <<'EOF_NKD_WORKFLOW_B64' | base64 -d | gzip -dc > "$workflow_file"
+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
+EOF_NKD_WORKFLOW_B64
 }
 
 add_hf_model() {
@@ -273,21 +613,24 @@ add_hf_model() {
 build_model_list() {
   HF_MODELS=()
   
-  # REQUERIMIENTOS EXCLUSIVOS FLUX.2 KLEIN 9B FP8
+  # Requerimientos del workflow NKD Klein adjunto.
+  # Se descarga el single-file FP8 base y se guarda con el nombre que espera el widget del workflow.
   if [ "$DOWNLOAD_FLUX2_KLEIN_9B_FP8" = "1" ]; then
-    add_hf_model "black-forest-labs/FLUX.2-klein-9b-fp8" "flux-2-klein-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
+    add_hf_model "black-forest-labs/FLUX.2-klein-base-9b-fp8" "flux-2-klein-base-9b-fp8.safetensors" "${MODELS_DIR}/diffusion_models/FLUX2/flux-2-klein-9b-fp8.safetensors"
     add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors"
-    add_hf_model "Comfy-Org/vae-text-encorder-for-flux-klein-9b" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
+    add_hf_model "Comfy-Org/flux2-dev" "split_files/vae/flux2-vae.safetensors" "${MODELS_DIR}/vae/flux2-vae.safetensors"
   fi
 
-  # REQUERIMIENTOS ADICIONALES REQUERIDOS POR EL NODO ONE-NODE (Faceswap, Pose, BiRefNet)
-  log "Añadiendo recursos específicos de One-Node Flux.2 Klein..."
-  add_hf_model "yanokusnir/flux-2-klein-one-node" "faceswap_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/faceswap_flux_klein_v1.safetensors"
-  add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_9b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_9b.safetensors"
-  add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_4b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_4b.safetensors"
-  add_hf_model "yanokusnir/flux-2-klein-one-node" "pose_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/pose_flux_klein_v1.safetensors"
-  add_hf_model "yanokusnir/flux-2-klein-one-node" "refcontrol_v2_poses_9b.safetensors" "${MODELS_DIR}/loras/refcontrol_v2_poses_9b.safetensors"
-  add_hf_model "Comfy-Org/BiRefNet" "birefnet.safetensors" "${MODELS_DIR}/background_removal/birefnet.safetensors"
+  # Extras de one-node-flux-2-klein. No aparecen como requeridos en el workflow adjunto.
+  if [ "$DOWNLOAD_ONE_NODE_EXTRAS" = "1" ]; then
+    log "Añadiendo recursos opcionales de One-Node Flux.2 Klein..."
+    add_hf_model "yanokusnir/flux-2-klein-one-node" "faceswap_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/faceswap_flux_klein_v1.safetensors"
+    add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_9b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_9b.safetensors"
+    add_hf_model "yanokusnir/flux-2-klein-one-node" "bfs_head_swap_4b.safetensors" "${MODELS_DIR}/loras/bfs_head_swap_4b.safetensors"
+    add_hf_model "yanokusnir/flux-2-klein-one-node" "pose_flux_klein_v1.safetensors" "${MODELS_DIR}/loras/pose_flux_klein_v1.safetensors"
+    add_hf_model "yanokusnir/flux-2-klein-one-node" "refcontrol_v2_poses_9b.safetensors" "${MODELS_DIR}/loras/refcontrol_v2_poses_9b.safetensors"
+    add_hf_model "Comfy-Org/BiRefNet" "birefnet.safetensors" "${MODELS_DIR}/background_removal/birefnet.safetensors"
+  fi
 }
 
 download_all_hf_models() {
@@ -295,7 +638,7 @@ download_all_hf_models() {
   mkdir -p "$HF_STAGING_DIR"
 
   if [ -n "$HF_TOKEN" ]; then
-    hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
+    hf auth login --token "$HF_TOKEN" --add-to-git-credential false >/dev/null 2>&1 ||       log "AVISO: hf auth login no pudo validar/escribir credenciales; se seguirá pasando --token en cada descarga."
   fi
 
   log "Descargando ${#HF_MODELS[@]} archivos pesados con paralelismo activo (Máx: ${HF_MAX_PARALLEL})..."
@@ -317,7 +660,14 @@ download_all_hf_models() {
     if ! wait "$pid"; then failed=1; fi
   done
 
-  if [ "$failed" -ne 0 ]; then return 1; fi
+  if [ "$failed" -ne 0 ]; then
+    log "AVISO: una o más descargas de Hugging Face fallaron. Reporte: ${HF_FAILURE_REPORT}"
+    if [ "$ALLOW_HF_DOWNLOAD_FAILURES" = "1" ]; then
+      log "Continuando porque ALLOW_HF_DOWNLOAD_FAILURES=1. Cambia a 0 si quieres fallo estricto."
+      return 0
+    fi
+    return 1
+  fi
 }
 
 download_hf_file() {
@@ -327,6 +677,9 @@ download_hf_file() {
   local lockfile="${output_path}.lock"
   local slot
   local temp_dir
+  local attempt
+  local cmd_log
+  local status
 
   slot=$(acquire_slot)
   mkdir -p "$(dirname "$output_path")"
@@ -341,22 +694,59 @@ download_hf_file() {
     return 0
   fi
 
-  temp_dir=$(mktemp -d "${HF_STAGING_DIR}/download.XXXXXX")
   local hf_token_args=()
   if [ -n "$HF_TOKEN" ]; then hf_token_args=(--token "$HF_TOKEN"); fi
 
-  log "Descargando vía hf_transfer: ${repo}/${file_path}"
-  if hf download "$repo" "$file_path" --local-dir "$temp_dir" "${hf_token_args[@]}" >/dev/null 2>&1; then
-    if [ -f "${temp_dir}/${file_path}" ]; then
+  attempt=1
+  while [ "$attempt" -le "$HF_DOWNLOAD_RETRIES" ]; do
+    temp_dir=$(mktemp -d "${HF_STAGING_DIR}/download.XXXXXX")
+    cmd_log="${output_path}.download_attempt_${attempt}.log"
+
+    if [ "$attempt" -eq 1 ]; then
+      log "Descargando vía hf_transfer/xet: ${repo}/${file_path}"
+      set +e
+      HF_HUB_ENABLE_HF_TRANSFER="$HF_HUB_ENABLE_HF_TRANSFER" HF_XET_HIGH_PERFORMANCE="$HF_XET_HIGH_PERFORMANCE"         hf download "$repo" "$file_path" --repo-type model --local-dir "$temp_dir" "${hf_token_args[@]}" >"$cmd_log" 2>&1
+      status=$?
+      set -e
+    else
+      log "Reintentando descarga estándar sin hf_transfer/xet: ${repo}/${file_path} (intento ${attempt}/${HF_DOWNLOAD_RETRIES})"
+      set +e
+      HF_HUB_ENABLE_HF_TRANSFER=0 HF_XET_HIGH_PERFORMANCE=0         hf download "$repo" "$file_path" --repo-type model --local-dir "$temp_dir" "${hf_token_args[@]}" >"$cmd_log" 2>&1
+      status=$?
+      set -e
+    fi
+
+    if [ "$status" -eq 0 ] && [ -f "${temp_dir}/${file_path}" ]; then
       mv -f "${temp_dir}/${file_path}" "$output_path"
       rm -rf "$temp_dir"
       rmdir "$lockfile" || true
       release_slot "$slot"
+      log "OK: ${output_path}"
       return 0
     fi
-  fi
 
-  rm -rf "$temp_dir"
+    if [ "$status" -eq 0 ] && [ -f "${temp_dir}/$(basename "$file_path")" ]; then
+      mv -f "${temp_dir}/$(basename "$file_path")" "$output_path"
+      rm -rf "$temp_dir"
+      rmdir "$lockfile" || true
+      release_slot "$slot"
+      log "OK: ${output_path}"
+      return 0
+    fi
+
+    log "AVISO: fallo descargando ${repo}/${file_path} (exit ${status}). Últimas líneas de ${cmd_log}:"
+    tail -n 25 "$cmd_log" 2>/dev/null | sed -E 's/hf_[A-Za-z0-9_]+/hf_***REDACTED***/g' | while IFS= read -r line; do log "  $line"; done
+    rm -rf "$temp_dir"
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+
+  {
+    echo "FAILED ${repo}/${file_path} -> ${output_path}"
+    echo "  Posibles causas: token sin acceso al repo gated, términos no aceptados, ruta de archivo inexistente, rate-limit/red, o incompatibilidad hf_transfer/xet."
+    echo "  Último log: ${cmd_log}"
+  } >> "$HF_FAILURE_REPORT" 2>/dev/null || true
+
   rmdir "$lockfile" || true
   release_slot "$slot"
   return 1
@@ -380,6 +770,123 @@ acquire_slot() {
 
 release_slot() {
   rmdir "$1" 2>/dev/null || rm -rf "$1"
+}
+
+create_symlink_or_copy() {
+  local source="$1"
+  local alias_path="$2"
+  [ -s "$source" ] || return 0
+  [ -e "$alias_path" ] && return 0
+  mkdir -p "$(dirname "$alias_path")"
+  ln -s "$source" "$alias_path" 2>/dev/null || cp -f "$source" "$alias_path" 2>/dev/null || true
+}
+
+create_model_aliases() {
+  local klein_model="${MODELS_DIR}/diffusion_models/FLUX2/flux-2-klein-9b-fp8.safetensors"
+  create_symlink_or_copy "$klein_model" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
+  create_symlink_or_copy "$klein_model" "${MODELS_DIR}/diffusion_models/flux-2-klein-base-9b-fp8.safetensors"
+}
+
+write_ollama_prompt_helper() {
+  mkdir -p "${WORKSPACE_DIR}/prompt_helpers"
+  cat > "${WORKSPACE_DIR}/prompt_helpers/klein_image_to_prompt_system.txt" <<'EOF_PROMPT'
+You are an image-to-prompt assistant for FLUX.2 Klein in ComfyUI.
+Analyze the reference image and return one concise production prompt.
+Describe subject, action, composition, lens/camera feel, lighting, materials, colors, mood, and background.
+For inpainting/editing, write it as a direct instruction when the user asks for an edit.
+Do not mention that you are analyzing an image. Do not add markdown. Return only the prompt.
+EOF_PROMPT
+
+  cat > "${WORKSPACE_DIR}/analyze_image_to_klein_prompt.sh" <<'EOF_HELPER'
+#!/bin/bash
+set -euo pipefail
+IMAGE_PATH="${1:-}"
+shift || true
+USER_INSTRUCTION="${*:-Create a faithful FLUX.2 Klein prompt from this image.}"
+MODEL="${OLLAMA_VISION_MODEL:-qwen2.5vl:7b}"
+HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+if [ -z "$IMAGE_PATH" ] || [ ! -f "$IMAGE_PATH" ]; then
+  echo "Uso: $0 /ruta/imagen.png [instruccion opcional]" >&2
+  exit 2
+fi
+python - "$IMAGE_PATH" "$MODEL" "$HOST" "$USER_INSTRUCTION" <<'PY_HELPER'
+import base64, json, sys, urllib.request
+image_path, model, host, instruction = sys.argv[1:5]
+with open(image_path, 'rb') as f:
+    image_b64 = base64.b64encode(f.read()).decode('ascii')
+system = """You are an image-to-prompt assistant for FLUX.2 Klein in ComfyUI. Analyze the reference image and return one concise production prompt. Describe subject, action, composition, lens/camera feel, lighting, materials, colors, mood, and background. For inpainting/editing, write it as a direct instruction when the user asks for an edit. Do not mention that you are analyzing an image. Do not add markdown. Return only the prompt."""
+payload = {
+    "model": model,
+    "stream": False,
+    "messages": [
+        {"role": "system", "content": system},
+        {"role": "user", "content": instruction, "images": [image_b64]},
+    ],
+}
+req = urllib.request.Request(
+    f"http://{host}/api/chat",
+    data=json.dumps(payload).encode('utf-8'),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=300) as resp:
+    data = json.load(resp)
+print(data.get("message", {}).get("content", "").strip())
+PY_HELPER
+EOF_HELPER
+  chmod +x "${WORKSPACE_DIR}/analyze_image_to_klein_prompt.sh"
+
+  cat > "${WORKSPACE_DIR}/refine_klein_prompt_with_dolphin.sh" <<'EOF_REFINER'
+#!/bin/bash
+set -euo pipefail
+HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+MODEL_FILE="${WORKSPACE:-/workspace}/.ollama_prompt_refiner_model"
+MODEL="${OLLAMA_DOLPHIN_MODEL:-dolphin-2.9.2-qwen2:7b}"
+if [ -f "$MODEL_FILE" ]; then
+  MODEL="$(cat "$MODEL_FILE")"
+fi
+if [ "$#" -gt 0 ]; then
+  INPUT="$*"
+else
+  INPUT="$(cat)"
+fi
+python - "$MODEL" "$HOST" "$INPUT" <<'PY_REFINER'
+import json, sys, urllib.request
+model, host, prompt = sys.argv[1:4]
+system = """You are a FLUX.2 Klein prompt refiner for ComfyUI. Rewrite the user's draft into one production-ready prompt. Preserve the intended edit, subject identity, composition, lighting, lens feel, colors, materials, and background. For inpainting, use direct imperative edit language. Keep it concise, concrete, and image-generation friendly. Do not add markdown, labels, explanations, safety commentary, or alternatives."""
+payload = {
+    "model": model,
+    "stream": False,
+    "messages": [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ],
+}
+req = urllib.request.Request(
+    f"http://{host}/api/chat",
+    data=json.dumps(payload).encode('utf-8'),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req, timeout=300) as resp:
+    data = json.load(resp)
+print(data.get("message", {}).get("content", "").strip())
+PY_REFINER
+EOF_REFINER
+  chmod +x "${WORKSPACE_DIR}/refine_klein_prompt_with_dolphin.sh"
+
+  cat > "${WORKSPACE_DIR}/analyze_image_to_klein_prompt_plus_dolphin.sh" <<'EOF_COMBINED'
+#!/bin/bash
+set -euo pipefail
+IMAGE_PATH="${1:-}"
+shift || true
+USER_INSTRUCTION="${*:-Create a faithful FLUX.2 Klein prompt from this image.}"
+if [ -z "$IMAGE_PATH" ] || [ ! -f "$IMAGE_PATH" ]; then
+  echo "Uso: $0 /ruta/imagen.png [instruccion opcional]" >&2
+  exit 2
+fi
+DRAFT="$(${WORKSPACE:-/workspace}/analyze_image_to_klein_prompt.sh "$IMAGE_PATH" "$USER_INSTRUCTION")"
+printf '%s\n' "$DRAFT" | ${WORKSPACE:-/workspace}/refine_klein_prompt_with_dolphin.sh
+EOF_COMBINED
+  chmod +x "${WORKSPACE_DIR}/analyze_image_to_klein_prompt_plus_dolphin.sh"
 }
 
 write_comfyui_memory_launchers() {
